@@ -60,6 +60,23 @@ APK: `app/build/outputs/apk/debug/app-debug.apk`.
 Требования: JDK 17+, Android SDK 35, build-tools 35. minSdk 26 — `isConnectable`
 у `ScanResult` появился в API 26.
 
+## Готовый APK
+
+Собранный debug-APK лежит в репозитории: `artifacts/blescanner-debug.apk`
+(package `io.dodo.blescanner`, versionCode 1, minSdk 26, targetSdk 35).
+
+```bash
+adb install -r artifacts/blescanner-debug.apk
+```
+
+Подписан отладочным ключом, поэтому для публикации в сторе не годится —
+это сборка «поставить и проверить». Артефакт обновляется вручную:
+
+```bash
+./gradlew :app:assembleDebug
+cp app/build/outputs/apk/debug/app-debug.apk artifacts/blescanner-debug.apk
+```
+
 ## Ограничения
 
 * Список устройств живёт в памяти процесса: если система убьёт процесс,
