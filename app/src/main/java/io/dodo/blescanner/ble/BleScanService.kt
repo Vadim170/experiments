@@ -26,12 +26,17 @@ import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
+import io.dodo.blescanner.model.CharacteristicValue
 import io.dodo.blescanner.model.DeviceState
 import io.dodo.blescanner.ui.MainActivity
 
 /**
- * Foreground-сервис: непрерывно сканирует BLE, ставит в очередь подключаемые
- * устройства, по очереди подключается к ним и читает все доступные характеристики.
+ * Foreground-сервис: непрерывно сканирует BLE, привязывает к каждому обнаружению
+ * координаты, ставит в очередь подключаемые устройства, по очереди подключается
+ * к ним и читает все доступные характеристики.
+ *
+ * Вся изменяемая внутренняя кухня (очередь, активная сессия, тайминги) трогается
+ * только с main-looper через [handler]: колбэки сканера приходят с binder-потока.
  */
 class BleScanService : Service() {
 
@@ -59,12 +64,14 @@ class BleScanService : Service() {
 
         fun start(context: Context) {
             val intent = Intent(context, BleScanService::class.java).setAction(ACTION_START)
-            ContextCompat.startForegroundService(context, intent)
+            runCatching { ContextCompat.startForegroundService(context, intent) }
+                .onFailure { BleLogger.logError("не удалось запустить сервис", it) }
         }
 
         fun stop(context: Context) {
             val intent = Intent(context, BleScanService::class.java).setAction(ACTION_STOP)
-            context.startService(intent)
+            runCatching { context.startService(intent) }
+                .onFailure { BleLogger.logError("не удалось остановить сервис", it) }
         }
     }
 
@@ -72,6 +79,7 @@ class BleScanService : Service() {
 
     private var adapter: BluetoothAdapter? = null
     private var scanner: BluetoothLeScanner? = null
+    private var locationTracker: LocationTracker? = null
     private var scanning = false
     private var running = false
     private var wakeLock: PowerManager.WakeLock? = null
@@ -114,20 +122,25 @@ class BleScanService : Service() {
     }
 
     private val scanCallback = object : ScanCallback() {
+        // Колбэки прилетают с binder-потока — уводим всё на main, иначе очередь
+        // и таблица таймингов правятся из двух потоков сразу.
         override fun onScanResult(callbackType: Int, result: ScanResult) {
-            handleResult(result)
+            handler.post { handleResult(result) }
         }
 
         override fun onBatchScanResults(results: MutableList<ScanResult>) {
-            results.forEach { handleResult(it) }
+            val snapshot = results.toList()
+            handler.post { snapshot.forEach { handleResult(it) } }
         }
 
         override fun onScanFailed(errorCode: Int) {
-            scanning = false
-            BleRepository.setScanning(false)
-            BleLogger.logError("сканирование не стартовало, код $errorCode")
-            // SCAN_FAILED_APPLICATION_REGISTRATION_FAILED и родственные лечатся повтором
-            handler.postDelayed({ if (running) startScan() }, 10_000)
+            handler.post {
+                scanning = false
+                BleRepository.setScanning(false)
+                BleLogger.logError("сканирование не стартовало, код $errorCode")
+                // SCAN_FAILED_APPLICATION_REGISTRATION_FAILED и родственные лечатся повтором
+                handler.postDelayed({ if (running) startScan() }, 10_000)
+            }
         }
     }
 
@@ -136,6 +149,7 @@ class BleScanService : Service() {
         BleLogger.init(applicationContext)
         val manager = getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
         adapter = manager?.adapter
+        locationTracker = LocationTracker(applicationContext)
         ContextCompat.registerReceiver(
             this,
             bluetoothStateReceiver,
@@ -152,7 +166,10 @@ class BleScanService : Service() {
                 return START_NOT_STICKY
             }
 
-            else -> startEverything()
+            else -> if (!startEverything()) {
+                stopSelf()
+                return START_NOT_STICKY
+            }
         }
         // START_STICKY: если система убьёт сервис под нехваткой памяти — поднимет заново
         return START_STICKY
@@ -166,22 +183,34 @@ class BleScanService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
-    private fun startEverything() {
-        if (running) return
-        running = true
+    /** @return false, если сервису нечего делать (нет разрешений) и надо самоубиться. */
+    private fun startEverything(): Boolean {
+        if (running) return true
+
+        val types = foregroundServiceTypes()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE && types == 0) {
+            // На Android 14+ startForeground с типом, под который нет разрешения,
+            // кидает SecurityException. Лучше честно не стартовать.
+            BleLogger.logError("нет разрешений на Bluetooth — сервис не стартует")
+            return false
+        }
 
         createChannel()
-        val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
-        } else {
-            0
+        val started = runCatching {
+            ServiceCompat.startForeground(this, NOTIFICATION_ID, buildNotification("Запускаюсь…"), types)
         }
-        ServiceCompat.startForeground(this, NOTIFICATION_ID, buildNotification("Запускаюсь…"), type)
+        if (started.isFailure) {
+            BleLogger.logError("startForeground не прошёл", started.exceptionOrNull())
+            return false
+        }
 
+        running = true
         acquireWakeLock()
+        locationTracker?.start()
         BleLogger.log("=== сервис сканирования запущен ===")
         startScan()
         handler.postDelayed(restartScanTask, SCAN_RESTART_MS)
+        return true
     }
 
     private fun stopEverything() {
@@ -189,6 +218,7 @@ class BleScanService : Service() {
         running = false
         handler.removeCallbacksAndMessages(null)
         stopScan()
+        locationTracker?.stop()
         activeReader?.cancel()
         activeReader = null
         queue.clear()
@@ -197,6 +227,22 @@ class BleScanService : Service() {
         BleRepository.setScanning(false)
         BleLogger.log("=== сервис сканирования остановлен ===")
         ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
+    }
+
+    /**
+     * Тип foreground-сервиса собираем из реально выданных разрешений: объявить в
+     * манифесте мало, на Android 14+ система проверяет их в момент startForeground.
+     */
+    private fun foregroundServiceTypes(): Int {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return 0
+        var types = 0
+        if (hasScanPermission() || hasConnectPermission()) {
+            types = types or ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+        }
+        if (locationTracker?.hasPermission() == true) {
+            types = types or ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
+        }
+        return types
     }
 
     // --- Сканирование -------------------------------------------------------
@@ -253,17 +299,29 @@ class BleScanService : Service() {
         BleRepository.setScanning(false)
     }
 
+    @SuppressLint("MissingPermission")
     private fun handleResult(result: ScanResult) {
         // Главный фильтр задачи: интересуют только подключаемые устройства.
         if (!result.isConnectable) return
 
         val address = result.device.address ?: return
+        // device.name требует BLUETOOTH_CONNECT, а рекламное имя — нет:
+        // сначала берём его из пакета и лишь потом лезем к устройству.
         val name = result.scanRecord?.deviceName
-            ?: runCatching { result.device.name }.getOrNull()
+            ?: if (hasConnectPermission()) {
+                runCatching { result.device.name }.getOrNull()
+            } else {
+                null
+            }
+        val location = locationTracker?.current()
 
-        val isNew = BleRepository.onSeen(address, name, result.rssi)
-        if (isNew) {
+        val seen = BleRepository.onSeen(address, name, result.rssi, location)
+        if (seen.isNew) {
             BleLogger.log("найдено $address ${name ?: "(без имени)"} rssi=${result.rssi}")
+        }
+        seen.recorded?.let { detection ->
+            val place = detection.location?.formatWithAccuracy() ?: "координат нет"
+            BleLogger.log("точка $address rssi=${detection.rssi} @ $place")
         }
         enqueue(address)
     }
@@ -320,7 +378,7 @@ class BleScanService : Service() {
     private fun onSessionFinished(
         address: String,
         gattName: String?,
-        values: List<io.dodo.blescanner.model.CharacteristicValue>,
+        values: List<CharacteristicValue>,
         error: String?,
     ) {
         activeReader = null
@@ -390,25 +448,32 @@ class BleScanService : Service() {
         ) {
             return
         }
-        getSystemService(NotificationManager::class.java)
-            .notify(NOTIFICATION_ID, buildNotification(text))
+        runCatching {
+            getSystemService(NotificationManager::class.java)
+                .notify(NOTIFICATION_ID, buildNotification(text))
+        }
     }
 
     private fun notificationText(): String {
         val devices = BleRepository.devices.value
         val read = devices.values.count { it.state == DeviceState.DONE }
-        return "Найдено ${devices.size}, прочитано $read"
+        val place = locationTracker?.current()?.format() ?: "гео —"
+        return "Найдено ${devices.size}, прочитано $read · $place"
     }
 
     @SuppressLint("WakelockTimeout")
     private fun acquireWakeLock() {
         if (wakeLock != null) return
-        val power = getSystemService(Context.POWER_SERVICE) as PowerManager
-        wakeLock = power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "BleScanner::scan").apply {
-            setReferenceCounted(false)
-            // без таймаута: сервис сам отпустит лок при остановке
-            acquire()
-        }
+        // Без объявленного WAKE_LOCK acquire() кидает SecurityException и роняет процесс,
+        // поэтому здесь и страховка, и разрешение в манифесте.
+        runCatching {
+            val power = getSystemService(Context.POWER_SERVICE) as PowerManager
+            wakeLock = power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "BleScanner::scan").apply {
+                setReferenceCounted(false)
+                // без таймаута: сервис сам отпустит лок при остановке
+                acquire()
+            }
+        }.onFailure { BleLogger.logError("не удалось взять wake lock", it) }
     }
 
     private fun releaseWakeLock() {

@@ -18,7 +18,6 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -30,10 +29,12 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Tab
 import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -49,6 +50,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import io.dodo.blescanner.ble.BleLogger
 import io.dodo.blescanner.ble.BleRepository
+import io.dodo.blescanner.ble.Geo
 import io.dodo.blescanner.model.BleDevice
 import io.dodo.blescanner.model.DeviceState
 import java.text.SimpleDateFormat
@@ -61,14 +63,17 @@ private val timeFormat = SimpleDateFormat("HH:mm:ss", Locale.US)
 @Composable
 fun MainScreen(
     permissionsGranted: Boolean,
+    backgroundLocationGranted: Boolean,
     logDir: String,
     onRequestPermissions: () -> Unit,
+    onRequestBackgroundLocation: () -> Unit,
     onStart: () -> Unit,
     onStop: () -> Unit,
+    onOpenLocation: (latitude: Double, longitude: Double, label: String) -> Unit,
 ) {
     val devicesMap by BleRepository.devices.collectAsStateWithLifecycle()
     val scanning by BleRepository.scanning.collectAsStateWithLifecycle()
-    var tab by rememberSaveable { androidx.compose.runtime.mutableIntStateOf(0) }
+    var tab by rememberSaveable { mutableIntStateOf(0) }
 
     // самые свежие — сверху, прочитанные приоритетнее просто увиденных
     val devices = remember(devicesMap) {
@@ -95,7 +100,19 @@ fun MainScreen(
         Column(Modifier.padding(padding).fillMaxSize()) {
 
             if (!permissionsGranted) {
-                PermissionBanner(onRequestPermissions)
+                Banner(
+                    title = "Нужны разрешения: Bluetooth, геолокация, уведомления",
+                    button = "Выдать",
+                    onClick = onRequestPermissions,
+                )
+            } else if (!backgroundLocationGranted) {
+                Banner(
+                    title = "Для координат при выключенном экране нужен доступ " +
+                        "к геолокации «всегда»",
+                    button = "Настроить",
+                    onClick = onRequestBackgroundLocation,
+                    warning = false,
+                )
             }
 
             Row(
@@ -113,7 +130,7 @@ fun MainScreen(
             }
 
             when (tab) {
-                0 -> DeviceList(devices)
+                0 -> DeviceList(devices, onOpenLocation)
                 else -> LogList(logDir)
             }
         }
@@ -121,26 +138,35 @@ fun MainScreen(
 }
 
 @Composable
-private fun PermissionBanner(onRequestPermissions: () -> Unit) {
+private fun Banner(
+    title: String,
+    button: String,
+    onClick: () -> Unit,
+    warning: Boolean = true,
+) {
     Card(
         modifier = Modifier.fillMaxWidth().padding(12.dp),
         colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.errorContainer,
+            containerColor = if (warning) {
+                MaterialTheme.colorScheme.errorContainer
+            } else {
+                MaterialTheme.colorScheme.secondaryContainer
+            },
         ),
     ) {
         Column(Modifier.padding(12.dp)) {
-            Text(
-                "Нужны разрешения на Bluetooth и уведомления",
-                style = MaterialTheme.typography.titleSmall,
-            )
+            Text(title, style = MaterialTheme.typography.titleSmall)
             Spacer(Modifier.height(8.dp))
-            Button(onClick = onRequestPermissions) { Text("Выдать") }
+            Button(onClick = onClick) { Text(button) }
         }
     }
 }
 
 @Composable
-private fun DeviceList(devices: List<BleDevice>) {
+private fun DeviceList(
+    devices: List<BleDevice>,
+    onOpenLocation: (Double, Double, String) -> Unit,
+) {
     if (devices.isEmpty()) {
         Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
             Text(
@@ -156,12 +182,15 @@ private fun DeviceList(devices: List<BleDevice>) {
         contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        items(devices, key = { it.address }) { device -> DeviceCard(device) }
+        items(devices, key = { it.address }) { device -> DeviceCard(device, onOpenLocation) }
     }
 }
 
 @Composable
-private fun DeviceCard(device: BleDevice) {
+private fun DeviceCard(
+    device: BleDevice,
+    onOpenLocation: (Double, Double, String) -> Unit,
+) {
     var expanded by rememberSaveable(device.address) { mutableStateOf(false) }
 
     Card(modifier = Modifier.fillMaxWidth().clickable { expanded = !expanded }) {
@@ -202,14 +231,60 @@ private fun DeviceCard(device: BleDevice) {
                 },
             )
 
-            if (device.values.isNotEmpty()) {
-                Spacer(Modifier.height(6.dp))
-                if (!expanded) {
+            LocationLine(device, onOpenLocation)
+
+            if (expanded) {
+                if (device.detections.isNotEmpty()) {
+                    HorizontalDivider(Modifier.padding(vertical = 6.dp))
                     Text(
-                        "Прочитано полей: ${device.values.size} — нажми, чтобы раскрыть",
-                        style = MaterialTheme.typography.bodySmall,
+                        "Точки обнаружения (${device.detections.size})",
+                        style = MaterialTheme.typography.labelLarge,
+                        fontWeight = FontWeight.Bold,
                     )
-                } else {
+                    device.detections.asReversed().forEach { detection ->
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(start = 8.dp, top = 3.dp, bottom = 3.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(
+                                text = timeFormat.format(Date(detection.timeMs)),
+                                style = MaterialTheme.typography.bodySmall,
+                                fontFamily = FontFamily.Monospace,
+                            )
+                            Spacer(Modifier.width(8.dp))
+                            Text(
+                                text = "${detection.rssi} dBm",
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                            Spacer(Modifier.width(8.dp))
+                            val location = detection.location
+                            if (location == null) {
+                                Text(
+                                    "без координат",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            } else {
+                                Text(
+                                    text = location.formatWithAccuracy(),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    fontFamily = FontFamily.Monospace,
+                                    modifier = Modifier.clickable {
+                                        onOpenLocation(
+                                            location.latitude,
+                                            location.longitude,
+                                            device.displayName,
+                                        )
+                                    },
+                                )
+                            }
+                        }
+                    }
+                }
+
+                if (device.values.isNotEmpty()) {
                     HorizontalDivider(Modifier.padding(vertical = 6.dp))
                     device.values.groupBy { it.serviceName }.forEach { (serviceName, values) ->
                         Text(
@@ -243,7 +318,52 @@ private fun DeviceCard(device: BleDevice) {
                         Spacer(Modifier.height(4.dp))
                     }
                 }
+            } else if (device.values.isNotEmpty() || device.detections.size > 1) {
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    text = "Полей: ${device.values.size} · точек: ${device.detections.size} — " +
+                        "нажми, чтобы раскрыть",
+                    style = MaterialTheme.typography.bodySmall,
+                )
             }
+        }
+    }
+}
+
+/** Где устройство видели последний раз и насколько оно «переехало» с первой встречи. */
+@Composable
+private fun LocationLine(
+    device: BleDevice,
+    onOpenLocation: (Double, Double, String) -> Unit,
+) {
+    val last = device.lastLocation
+    Spacer(Modifier.height(2.dp))
+    if (last == null) {
+        Text(
+            text = "📍 координат нет",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        return
+    }
+
+    val first = device.firstLocation
+    val spread = if (first != null && first != last) {
+        " · разброс ${Geo.distanceMeters(first, last).toInt()} м"
+    } else {
+        ""
+    }
+
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Text(
+            text = "📍 ${last.formatWithAccuracy()}$spread",
+            style = MaterialTheme.typography.bodySmall,
+            fontFamily = FontFamily.Monospace,
+        )
+        TextButton(
+            onClick = { onOpenLocation(last.latitude, last.longitude, device.displayName) },
+        ) {
+            Text("на карте", style = MaterialTheme.typography.bodySmall)
         }
     }
 }
@@ -284,10 +404,7 @@ private fun LogList(logDir: String) {
         Text(
             text = "Файлы лога: $logDir",
             style = MaterialTheme.typography.bodySmall,
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(12.dp)
-                .clip(RoundedCornerShape(4.dp)),
+            modifier = Modifier.fillMaxWidth().padding(12.dp),
         )
         HorizontalDivider()
         LazyColumn(

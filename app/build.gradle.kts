@@ -35,6 +35,17 @@ android {
     buildFeatures {
         compose = true
     }
+
+    lint {
+        // MissingPermission на уровне ошибки: именно этот класс проблем ронял приложение
+        // (WAKE_LOCK не был объявлен, и acquire() кидал SecurityException).
+        warningsAsErrors = false
+        abortOnError = true
+        error += listOf("MissingPermission", "InlinedApi", "ForegroundServicePermission")
+        // Совет слить mipmap-anydpi-v26 в mipmap-anydpi неприменим:
+        // без квалификатора версии AAPT2 не находит ресурс вовсе.
+        disable += "ObsoleteSdkInt"
+    }
 }
 
 dependencies {
@@ -52,4 +63,6 @@ dependencies {
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.material:material-icons-extended")
     debugImplementation("androidx.compose.ui:ui-tooling")
+
+    testImplementation("junit:junit:4.13.2")
 }

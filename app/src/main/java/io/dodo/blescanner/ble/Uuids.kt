@@ -1,5 +1,6 @@
 package io.dodo.blescanner.ble
 
+import java.util.Locale
 import java.util.UUID
 
 /**
@@ -63,18 +64,22 @@ object Uuids {
         return text.substring(4, 8).toIntOrNull(16)
     }
 
+    // Везде Locale.US: иначе на русской локали дробные значения уезжают на запятую,
+    // а лог и geo:-ссылки перестают разбираться.
+    private fun fmt(format: String, vararg args: Any?) = String.format(Locale.US, format, *args)
+
     fun serviceName(uuid: UUID): String {
         val id = shortId(uuid) ?: return "Служба ${uuid.toString().take(8)}…"
-        return SERVICES[id] ?: "Служба 0x%04X".format(id)
+        return SERVICES[id] ?: fmt("Служба 0x%04X", id)
     }
 
     fun characteristicName(uuid: UUID): String {
         val id = shortId(uuid) ?: return uuid.toString()
-        return CHARACTERISTICS[id] ?: "0x%04X".format(id)
+        return CHARACTERISTICS[id] ?: fmt("0x%04X", id)
     }
 
     fun toHex(bytes: ByteArray): String =
-        if (bytes.isEmpty()) "(пусто)" else bytes.joinToString(" ") { "%02X".format(it) }
+        if (bytes.isEmpty()) "(пусто)" else bytes.joinToString(" ") { fmt("%02X", it) }
 
     /**
      * Пытается получить осмысленное представление значения: сначала по известному
@@ -88,9 +93,9 @@ object Uuids {
             when (id) {
                 0x2A19 -> return "${bytes[0].toInt() and 0xFF} %"
                 0x2A07 -> return "${bytes[0].toInt()} dBm"
-                0x2A01 -> if (bytes.size >= 2) return "0x%04X".format(le16(bytes, 0))
-                0x2A6E -> if (bytes.size >= 2) return "%.2f °C".format(le16Signed(bytes, 0) / 100.0)
-                0x2A6F -> if (bytes.size >= 2) return "%.2f %%".format(le16(bytes, 0) / 100.0)
+                0x2A01 -> if (bytes.size >= 2) return fmt("0x%04X", le16(bytes, 0))
+                0x2A6E -> if (bytes.size >= 2) return fmt("%.2f °C", le16Signed(bytes, 0) / 100.0)
+                0x2A6F -> if (bytes.size >= 2) return fmt("%.2f %%", le16(bytes, 0) / 100.0)
             }
         }
 

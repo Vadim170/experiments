@@ -1,5 +1,7 @@
 package io.dodo.blescanner.model
 
+import java.util.Locale
+
 /** Состояние работы с конкретным устройством. */
 enum class DeviceState {
     /** Устройство найдено сканером, в очередь ещё не поставлено. */
@@ -17,6 +19,33 @@ enum class DeviceState {
     /** Последняя попытка чтения завершилась ошибкой. */
     ERROR,
 }
+
+/** Координаты на момент обнаружения. */
+data class LocationFix(
+    val latitude: Double,
+    val longitude: Double,
+    /** Заявленная точность в метрах; null, если провайдер её не дал. */
+    val accuracyMeters: Float?,
+    /** gps / network / fused — чем получено. */
+    val provider: String,
+    /** Время самого фикса, а не момента использования. */
+    val timeMs: Long,
+) {
+    // Locale.US принципиально: на русской локали "%.6f" даёт запятую,
+    // и такие координаты ломают geo:-ссылку и разбор лога.
+    fun format(): String = String.format(Locale.US, "%.6f, %.6f", latitude, longitude)
+
+    fun formatWithAccuracy(): String =
+        accuracyMeters?.let { "${format()} ±${it.toInt()} м" } ?: format()
+}
+
+/** Одно зафиксированное обнаружение устройства с привязкой к месту. */
+data class Detection(
+    val timeMs: Long,
+    val rssi: Int,
+    /** null, если фикса на этот момент ещё не было (гео выключено, не успели поймать). */
+    val location: LocationFix?,
+)
 
 /** Значение одной прочитанной характеристики. */
 data class CharacteristicValue(
@@ -40,10 +69,17 @@ data class BleDevice(
     val lastSeen: Long,
     val seenCount: Int,
     val state: DeviceState,
+    /** Точки обнаружения, самая свежая — последняя. Список ограничен сверху. */
+    val detections: List<Detection> = emptyList(),
     val values: List<CharacteristicValue> = emptyList(),
     val lastError: String? = null,
     val lastReadAt: Long? = null,
     val attempts: Int = 0,
 ) {
     val displayName: String get() = name?.takeIf { it.isNotBlank() } ?: "(без имени)"
+
+    /** Последние известные координаты устройства. */
+    val lastLocation: LocationFix? get() = detections.lastOrNull { it.location != null }?.location
+
+    val firstLocation: LocationFix? get() = detections.firstOrNull { it.location != null }?.location
 }

@@ -2,7 +2,9 @@ package io.dodo.blescanner.ble
 
 import io.dodo.blescanner.model.BleDevice
 import io.dodo.blescanner.model.CharacteristicValue
+import io.dodo.blescanner.model.Detection
 import io.dodo.blescanner.model.DeviceState
+import io.dodo.blescanner.model.LocationFix
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.update
@@ -14,6 +16,13 @@ import kotlinx.coroutines.flow.update
  */
 object BleRepository {
 
+    /** Что случилось при обработке рекламного пакета — нужно для логирования. */
+    data class SeenResult(
+        val isNew: Boolean,
+        /** Не null, если обнаружение записалось отдельной точкой. */
+        val recorded: Detection?,
+    )
+
     private val _devices = MutableStateFlow<Map<String, BleDevice>>(emptyMap())
     val devices: StateFlow<Map<String, BleDevice>> = _devices
 
@@ -24,12 +33,26 @@ object BleRepository {
         _scanning.value = value
     }
 
-    /** Устройство замечено сканером. Возвращает true, если увидели его впервые. */
-    fun onSeen(address: String, name: String?, rssi: Int): Boolean {
+    /** Устройство замечено сканером в точке [location] (может быть null). */
+    fun onSeen(address: String, name: String?, rssi: Int, location: LocationFix?): SeenResult {
         var isNew = false
+        var recorded: Detection? = null
+
         _devices.update { map ->
             val now = System.currentTimeMillis()
             val existing = map[address]
+
+            val previousDetections = existing?.detections ?: emptyList()
+            val detection = if (DetectionPolicy.shouldRecord(previousDetections.lastOrNull(), now, location)) {
+                Detection(timeMs = now, rssi = rssi, location = location)
+            } else {
+                null
+            }
+            recorded = detection
+            val detections = detection
+                ?.let { DetectionPolicy.append(previousDetections, it) }
+                ?: previousDetections
+
             val updated = if (existing == null) {
                 isNew = true
                 BleDevice(
@@ -40,6 +63,7 @@ object BleRepository {
                     lastSeen = now,
                     seenCount = 1,
                     state = DeviceState.SEEN,
+                    detections = detections,
                 )
             } else {
                 existing.copy(
@@ -48,11 +72,13 @@ object BleRepository {
                     rssi = rssi,
                     lastSeen = now,
                     seenCount = existing.seenCount + 1,
+                    detections = detections,
                 )
             }
             map + (address to updated)
         }
-        return isNew
+
+        return SeenResult(isNew, recorded)
     }
 
     fun setState(address: String, state: DeviceState) {
