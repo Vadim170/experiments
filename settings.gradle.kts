@@ -20,5 +20,9 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "BleScanner"
+rootProject.name = "DodoAndroid"
+
+// :app     — BLE Scanner, фоновый скан и опрос BLE-устройств
+// :obdmap  — OBD Trip Map, карты поездок по данным ELM327
 include(":app")
+include(":obdmap")
