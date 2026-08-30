@@ -80,6 +80,16 @@ class ElmSession(private val io: ElmIo) {
     private var hasIntakeTemp = false
 
     /**
+     * Медленные показатели, на которые блок реально ответил.
+     *
+     * Как и с расходом, битовой карте тут верить нельзя: уровень бака часто в
+     * ней не заявлен, но читается — из-за этой проверки бак и не показывался.
+     * Пробуем все разом при первом медленном цикле и дальше спрашиваем только
+     * то, что ответило.
+     */
+    private var slowPids: Set<Int>? = null
+
+    /**
      * Полная инициализация адаптера и шины.
      *
      * @return null при успехе, иначе текст ошибки для интерфейса.
@@ -138,6 +148,10 @@ class ElmSession(private val io: ElmIo) {
      */
     suspend fun probeFuelSource(): FuelSource {
         val notes = mutableListOf<String>()
+
+        // Скорость нужна и сама по себе, и как вход для ускорения — показываем
+        // её состояние первой, чтобы было видно, если молчит именно она.
+        notes += if (read(Pids.SPEED) != null) "SPD ✓" else "SPD —"
 
         val engineRate = read(Pids.ENGINE_FUEL_RATE)?.let { Pids.fuelRateLitersPerHour(it) }
         notes += if (engineRate != null) "5E ✓" else "5E —"
@@ -240,14 +254,30 @@ class ElmSession(private val io: ElmIo) {
         var coolant: Int? = null
         var load: Double? = null
         if (includeSlow) {
-            if (Pids.FUEL_LEVEL in supportedPids) {
+            // Первый медленный цикл пробует всё, дальше спрашиваем только то,
+            // что действительно ответило.
+            val known = slowPids
+            val answered = mutableSetOf<Int>()
+
+            if (known == null || Pids.FUEL_LEVEL in known) {
                 fuelLevel = read(Pids.FUEL_LEVEL)?.let { Pids.fuelLevelPercent(it) }
+                if (fuelLevel != null) answered += Pids.FUEL_LEVEL
             }
-            if (Pids.COOLANT_TEMP in supportedPids) {
+            if (known == null || Pids.COOLANT_TEMP in known) {
                 coolant = read(Pids.COOLANT_TEMP)?.let { Pids.coolantTempC(it) }
+                if (coolant != null) answered += Pids.COOLANT_TEMP
             }
-            if (Pids.ENGINE_LOAD in supportedPids) {
+            if (known == null || Pids.ENGINE_LOAD in known) {
                 load = read(Pids.ENGINE_LOAD)?.let { Pids.engineLoadPercent(it) }
+                if (load != null) answered += Pids.ENGINE_LOAD
+            }
+
+            if (known == null) {
+                slowPids = answered
+                Logger.log(
+                    "медленные PID ответили: " +
+                        if (answered.isEmpty()) "ни один" else answered.joinToString { "%02X".format(it) },
+                )
             }
         }
 

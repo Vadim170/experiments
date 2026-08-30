@@ -50,7 +50,10 @@ class ElmSessionTest {
         // порядок важен: эхо и переводы строк надо выключить до первого запроса
         // данных, а источник расхода определяется реальными запросами 5E и 10
         assertEquals(
-            listOf("ATZ", "ATE0", "ATL0", "ATS0", "ATH0", "ATSP0", "0100", "0120", "015E", "0110"),
+            listOf(
+                "ATZ", "ATE0", "ATL0", "ATS0", "ATH0", "ATSP0",
+                "0100", "0120", "010D", "015E", "0110",
+            ),
             io.sent,
         )
         assertTrue(Pids.SPEED in session.supportedPids)
@@ -129,8 +132,18 @@ class ElmSessionTest {
     fun `проба записывает что ответило`() = runTest {
         val session = ElmSession(FakeElm(rapidLike))
         session.initialize()
+        assertTrue(session.diagnostics.contains("SPD ✓"))
         assertTrue(session.diagnostics.contains("5E —"))
         assertTrue(session.diagnostics.contains("MAF ✓"))
+    }
+
+    @Test
+    fun `молчащая скорость видна в диагностике`() = runTest {
+        // Если молчит скорость, не будет ни трека по OBD, ни ускорения —
+        // это должно быть видно на экране, а не гадаться
+        val session = ElmSession(FakeElm(rapidLike - "010D"))
+        session.initialize()
+        assertTrue(session.diagnostics.contains("SPD —"))
     }
 
     @Test

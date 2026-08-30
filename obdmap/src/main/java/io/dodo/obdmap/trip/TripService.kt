@@ -25,6 +25,7 @@ import io.dodo.obdmap.data.TripEntity
 import io.dodo.obdmap.obd.ElmBleClient
 import io.dodo.obdmap.obd.ElmSession
 import io.dodo.obdmap.obd.FuelMath
+import io.dodo.obdmap.obd.ObdSnapshot
 import io.dodo.obdmap.ui.MainActivity
 import io.dodo.obdmap.util.Logger
 import io.dodo.obdmap.util.Prefs
@@ -44,6 +45,12 @@ import java.util.Locale
 /**
  * Запись поездки: держит связь с ELM327, опрашивает шину, складывает трек
  * в базу и отдаёт живые показания интерфейсу.
+ *
+ * Два режима:
+ * * **ручной** — поездка начинается по кнопке и заканчивается по кнопке;
+ * * **автоматический** — сервис ждёт появления адаптера (стек BLE делает это
+ *   сам через autoConnect), открывает поездку, когда двигатель заработал, и
+ *   закрывает её, когда данные с шины пропали надолго. Дальше снова ждёт.
  */
 class TripService : Service() {
 
@@ -51,12 +58,16 @@ class TripService : Service() {
         const val ACTION_START = "io.dodo.obdmap.START"
         const val ACTION_STOP = "io.dodo.obdmap.STOP"
         const val EXTRA_ADDRESS = "address"
+        const val EXTRA_AUTO = "auto"
 
         private const val CHANNEL_ID = "trip_recording"
         private const val NOTIFICATION_ID = 7
 
-        /** Пауза между циклами опроса. Реальный темп упирается в скорость BLE. */
+        /** Пауза между циклами опроса во время поездки. */
         private const val POLL_INTERVAL_MS = 250L
+
+        /** Пауза между циклами, пока поездки нет: реже, чтобы не жечь батарею. */
+        private const val IDLE_POLL_INTERVAL_MS = 2_000L
 
         /** Раз в столько циклов дочитываем медленные показатели (бак, температура). */
         private const val SLOW_EVERY = 20
@@ -64,13 +75,26 @@ class TripService : Service() {
         /** Точки копим и пишем пачкой: запись каждой по отдельности зря будит диск. */
         private const val POINT_BATCH = 10
 
-        /** Сколько раз пробуем восстановить связь, прежде чем закончить поездку. */
-        private const val MAX_RECONNECTS = 3
+        /** Двигатель считаем работающим выше этих оборотов. */
+        private const val ENGINE_RUNNING_RPM = 300.0
 
-        fun start(context: Context, address: String) {
+        /** Нет данных с шины столько — поездка закончилась (зажигание выключили). */
+        private const val IDLE_STOP_MS = 3 * 60 * 1000L
+
+        /** Пауза перед повторной попыткой связи в автоматическом режиме. */
+        private const val RECONNECT_DELAY_MS = 5_000L
+
+        /**
+         * Если связь вернулась в этот срок, продолжаем ту же поездку.
+         * Иначе светофор с потерей связи резал бы поездку на куски.
+         */
+        private const val RESUME_WINDOW_MS = 3 * 60 * 1000L
+
+        fun start(context: Context, address: String, auto: Boolean) {
             val intent = Intent(context, TripService::class.java)
                 .setAction(ACTION_START)
                 .putExtra(EXTRA_ADDRESS, address)
+                .putExtra(EXTRA_AUTO, auto)
             runCatching { ContextCompat.startForegroundService(context, intent) }
                 .onFailure { Logger.error("не удалось запустить запись", it) }
         }
@@ -80,6 +104,14 @@ class TripService : Service() {
             runCatching { context.startService(intent) }
                 .onFailure { Logger.error("не удалось остановить запись", it) }
         }
+    }
+
+    /** Поездка, которая пишется прямо сейчас. */
+    private class ActiveTrip(val id: Long) {
+        val accumulator = TripAccumulator()
+        val acceleration = AccelerationTracker()
+        val pending = mutableListOf<PointEntity>()
+        var lastDataAt: Long = System.currentTimeMillis()
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -100,7 +132,7 @@ class TripService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
-            stopRecording("Запись остановлена")
+            stopEverything("Запись остановлена")
             stopSelf()
             return START_NOT_STICKY
         }
@@ -112,6 +144,8 @@ class TripService : Service() {
             stopSelf()
             return START_NOT_STICKY
         }
+        val auto = intent?.getBooleanExtra(EXTRA_AUTO, false)
+            ?: Prefs.autoMode(applicationContext)
 
         val types = foregroundServiceTypes()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE && types == 0) {
@@ -126,7 +160,7 @@ class TripService : Service() {
             ServiceCompat.startForeground(
                 this,
                 NOTIFICATION_ID,
-                buildNotification("Подключаюсь к адаптеру…"),
+                buildNotification(if (auto) "Жду адаптер…" else "Подключаюсь к адаптеру…"),
                 types,
             )
         }
@@ -139,157 +173,226 @@ class TripService : Service() {
 
         if (worker?.isActive == true) return START_STICKY
         acquireWakeLock()
-        worker = scope.launch { record(address) }
+        locationSource.start()
+        worker = scope.launch { supervise(address, auto) }
         return START_STICKY
     }
 
     override fun onDestroy() {
-        stopRecording(null)
+        stopEverything(null)
         scope.cancel()
         super.onDestroy()
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
-    // --- Запись -------------------------------------------------------------
+    // --- Главный цикл -------------------------------------------------------
 
-    private suspend fun record(address: String) {
-        val session = ElmSession(client)
-
-        if (!connectAndInit(address, session)) {
-            stopSelfSafely()
-            return
-        }
-
-        val tripId = dao.insertTrip(
-            TripEntity(startedAt = System.currentTimeMillis(), fuelSource = session.fuelSource.title),
-        )
-        TripSession.startNewTrip(tripId)
-        TripSession.update { it.copy(fuelSource = session.fuelSource) }
-        locationSource.start()
-        Logger.log("поездка $tripId начата, расход по: ${session.fuelSource.title}")
-
-        val accumulator = TripAccumulator()
-        val acceleration = AccelerationTracker()
-        val pending = mutableListOf<PointEntity>()
-        var cycle = 0
-        var reconnects = 0
-
+    /**
+     * Держит связь и ведёт поездки. В ручном режиме выходит после первой же
+     * потери связи, в автоматическом — ждёт адаптер снова.
+     */
+    private suspend fun supervise(address: String, auto: Boolean) {
+        var trip: ActiveTrip? = null
         try {
             while (currentCoroutineContext().isActive) {
-                if (!client.connected.value) {
-                    if (reconnects >= MAX_RECONNECTS) {
-                        TripSession.setStatus(ConnectionState.ERROR, "Связь с адаптером потеряна")
-                        break
-                    }
-                    reconnects++
-                    TripSession.setStatus(
-                        ConnectionState.CONNECTING,
-                        "Переподключение $reconnects из $MAX_RECONNECTS…",
-                    )
-                    delay(2_000)
-                    if (connectAndInit(address, session)) {
-                        TripSession.setStatus(ConnectionState.LIVE, "Идёт запись")
-                    } else {
-                        continue
-                    }
-                }
+                val session = ElmSession(client)
 
-                val now = System.currentTimeMillis()
-                val snapshot = session.readSnapshot(now, includeSlow = cycle % SLOW_EVERY == 0)
-                val location = locationSource.current()
-                val accelerationMs2 = acceleration.add(now, snapshot.speedKmh)
-
-                val sample = TripSample(
-                    timeMs = now,
-                    latitude = location?.latitude,
-                    longitude = location?.longitude,
-                    speedKmh = snapshot.speedKmh,
-                    fuelRateLitersPerHour = snapshot.fuelRateLitersPerHour,
+                TripSession.setStatus(
+                    if (auto) ConnectionState.WAITING else ConnectionState.CONNECTING,
+                    if (auto) "Жду адаптер — поездка начнётся сама" else "Подключаюсь к адаптеру…",
                 )
-                accumulator.add(sample)
+                updateNotification(if (auto) "Жду адаптер…" else "Подключаюсь…")
 
-                val instant = snapshot.fuelRateLitersPerHour?.let { rate ->
-                    FuelMath.litersPer100Km(rate, snapshot.speedKmh ?: 0.0)
+                if (!connectAndInit(address, session, autoConnect = auto)) {
+                    if (!auto) return
+                    // Поездку, которую уже не продолжить, закрываем
+                    trip = finalizeIfStale(trip)
+                    delay(RECONNECT_DELAY_MS)
+                    continue
                 }
 
-                TripSession.update { state ->
-                    state.copy(
-                        connection = ConnectionState.LIVE,
-                        status = "Идёт запись",
-                        speedKmh = snapshot.speedKmh ?: state.speedKmh,
-                        rpm = snapshot.rpm ?: state.rpm,
-                        fuelRateLitersPerHour = snapshot.fuelRateLitersPerHour,
-                        litersPer100Km = instant,
-                        fuelLevelPercent = snapshot.fuelLevelPercent ?: state.fuelLevelPercent,
-                        coolantTempC = snapshot.coolantTempC ?: state.coolantTempC,
-                        accelerationMs2 = accelerationMs2 ?: state.accelerationMs2,
-                        fuelSource = session.fuelSource,
-                        diagnostics = session.diagnostics,
-                        stats = accumulator.stats,
-                        hasLocation = location != null,
-                    )
-                }
-
-                if (location != null) {
-                    TripSession.addTrackPoint(
-                        TrackPoint(
-                            timeMs = now,
-                            latitude = location.latitude,
-                            longitude = location.longitude,
-                            speedKmh = snapshot.speedKmh,
-                            litersPer100Km = instant,
-                            accelerationMs2 = accelerationMs2,
-                        ),
-                    )
-                }
-
-                // График текущей поездки рисуем и без GPS: данные с шины идут
-                TripSession.addSample(
-                    LiveSample(
-                        timeMs = now,
-                        speedKmh = snapshot.speedKmh,
-                        litersPer100Km = instant,
-                        accelerationMs2 = accelerationMs2,
-                    ),
-                )
-
-                pending += PointEntity(
-                    tripId = tripId,
-                    timeMs = now,
-                    latitude = location?.latitude,
-                    longitude = location?.longitude,
-                    speedKmh = snapshot.speedKmh,
-                    rpm = snapshot.rpm,
-                    fuelRateLitersPerHour = snapshot.fuelRateLitersPerHour,
-                    litersPer100Km = instant,
-                    accelerationMs2 = accelerationMs2,
-                )
-                if (pending.size >= POINT_BATCH) {
-                    dao.insertPoints(pending.toList())
-                    pending.clear()
-                }
-
-                if (cycle % 8 == 0) {
-                    updateNotification(notificationText(accumulator.stats, snapshot.speedKmh))
-                }
-                cycle++
-                delay(POLL_INTERVAL_MS)
+                trip = driveLoop(session, trip, auto)
+                runCatching { client.close() }
+                if (!auto) return
             }
         } finally {
-            // Остановка отменяет корутину, и обычный код после цикла до итогов
-            // уже не доходит: дописываем хвост и закрываем поездку вне отмены.
-            withContext(NonCancellable) {
-                if (pending.isNotEmpty()) runCatching { dao.insertPoints(pending.toList()) }
-                runCatching { finishTrip(tripId, accumulator.stats) }
-            }
+            // Остановка отменяет корутину, и обычный код до итогов уже не доходит
+            withContext(NonCancellable) { closeTrip(trip) }
         }
-        stopSelfSafely()
     }
 
-    private suspend fun connectAndInit(address: String, session: ElmSession): Boolean {
-        TripSession.setStatus(ConnectionState.CONNECTING, "Подключаюсь к адаптеру…")
+    /**
+     * Опрос шины, пока держится связь.
+     *
+     * @return поездку, которую можно продолжить при возврате связи, либо null
+     */
+    private suspend fun driveLoop(
+        session: ElmSession,
+        resumed: ActiveTrip?,
+        auto: Boolean,
+    ): ActiveTrip? {
+        var trip = resumed
+        var cycle = 0
 
+        while (currentCoroutineContext().isActive && client.connected.value) {
+            val now = System.currentTimeMillis()
+            val snapshot = session.readSnapshot(now, includeSlow = cycle % SLOW_EVERY == 0)
+            val hasData = snapshot.speedKmh != null || snapshot.rpm != null
+
+            if (trip == null) {
+                // В автоматическом режиме ждём признаков заведённого мотора,
+                // в ручном пишем всё подряд с момента нажатия кнопки.
+                if (!auto || engineRunning(snapshot)) {
+                    trip = startTrip(session)
+                }
+            } else if (hasData) {
+                trip.lastDataAt = now
+            } else if (now - trip.lastDataAt > IDLE_STOP_MS) {
+                Logger.log("данных нет ${IDLE_STOP_MS / 60_000} мин — закрываю поездку")
+                closeTrip(trip)
+                trip = null
+                TripSession.setStatus(ConnectionState.WAITING, "Поездка завершена, жду следующую")
+            }
+
+            if (trip != null) {
+                recordSample(session, trip, snapshot, now)
+                if (cycle % 8 == 0) {
+                    updateNotification(
+                        notificationText(trip.accumulator.stats, snapshot.speedKmh),
+                    )
+                }
+            } else {
+                TripSession.update {
+                    it.copy(
+                        connection = ConnectionState.WAITING,
+                        status = "Адаптер на связи, жду запуска двигателя",
+                        diagnostics = session.diagnostics,
+                    )
+                }
+                updateNotification("Жду запуска двигателя")
+            }
+
+            cycle++
+            delay(if (trip != null) POLL_INTERVAL_MS else IDLE_POLL_INTERVAL_MS)
+        }
+
+        // Связь пропала: сбрасываем окно ускорения, иначе после паузы получим
+        // мнимый рывок из скорости «до» и «после».
+        trip?.acceleration?.reset()
+        return trip
+    }
+
+    /**
+     * Признаки заведённого мотора. Обороты — самый надёжный, но PID 0C
+     * поддерживают не все блоки, поэтому годятся и движение, и ненулевой расход.
+     */
+    private fun engineRunning(snapshot: ObdSnapshot): Boolean {
+        val rpm = snapshot.rpm
+        if (rpm != null && rpm >= ENGINE_RUNNING_RPM) return true
+        val speed = snapshot.speedKmh
+        if (speed != null && speed > 0) return true
+        val fuelRate = snapshot.fuelRateLitersPerHour
+        return fuelRate != null && fuelRate > 0
+    }
+
+    private suspend fun startTrip(session: ElmSession): ActiveTrip {
+        val id = dao.insertTrip(
+            TripEntity(startedAt = System.currentTimeMillis(), fuelSource = session.fuelSource.title),
+        )
+        TripSession.startNewTrip(id)
+        TripSession.update { it.copy(fuelSource = session.fuelSource) }
+        Logger.log("поездка $id начата, расход по: ${session.fuelSource.title}")
+        return ActiveTrip(id)
+    }
+
+    private suspend fun recordSample(
+        session: ElmSession,
+        trip: ActiveTrip,
+        snapshot: ObdSnapshot,
+        now: Long,
+    ) {
+        val location = locationSource.current()
+        val accelerationMs2 = trip.acceleration.add(now, snapshot.speedKmh)
+
+        trip.accumulator.add(
+            TripSample(
+                timeMs = now,
+                latitude = location?.latitude,
+                longitude = location?.longitude,
+                speedKmh = snapshot.speedKmh,
+                fuelRateLitersPerHour = snapshot.fuelRateLitersPerHour,
+            ),
+        )
+
+        val instant = snapshot.fuelRateLitersPerHour?.let { rate ->
+            FuelMath.litersPer100Km(rate, snapshot.speedKmh ?: 0.0)
+        }
+
+        TripSession.update { state ->
+            state.copy(
+                connection = ConnectionState.LIVE,
+                status = "Идёт запись",
+                speedKmh = snapshot.speedKmh ?: state.speedKmh,
+                rpm = snapshot.rpm ?: state.rpm,
+                fuelRateLitersPerHour = snapshot.fuelRateLitersPerHour,
+                litersPer100Km = instant,
+                fuelLevelPercent = snapshot.fuelLevelPercent ?: state.fuelLevelPercent,
+                coolantTempC = snapshot.coolantTempC ?: state.coolantTempC,
+                accelerationMs2 = accelerationMs2 ?: state.accelerationMs2,
+                fuelSource = session.fuelSource,
+                diagnostics = session.diagnostics,
+                stats = trip.accumulator.stats,
+                tripId = trip.id,
+                hasLocation = location != null,
+            )
+        }
+
+        if (location != null) {
+            TripSession.addTrackPoint(
+                TrackPoint(
+                    timeMs = now,
+                    latitude = location.latitude,
+                    longitude = location.longitude,
+                    speedKmh = snapshot.speedKmh,
+                    litersPer100Km = instant,
+                    accelerationMs2 = accelerationMs2,
+                ),
+            )
+        }
+
+        // График текущей поездки рисуем и без GPS: данные с шины идут
+        TripSession.addSample(
+            LiveSample(
+                timeMs = now,
+                speedKmh = snapshot.speedKmh,
+                litersPer100Km = instant,
+                accelerationMs2 = accelerationMs2,
+            ),
+        )
+
+        trip.pending += PointEntity(
+            tripId = trip.id,
+            timeMs = now,
+            latitude = location?.latitude,
+            longitude = location?.longitude,
+            speedKmh = snapshot.speedKmh,
+            rpm = snapshot.rpm,
+            fuelRateLitersPerHour = snapshot.fuelRateLitersPerHour,
+            litersPer100Km = instant,
+            accelerationMs2 = accelerationMs2,
+        )
+        if (trip.pending.size >= POINT_BATCH) {
+            dao.insertPoints(trip.pending.toList())
+            trip.pending.clear()
+        }
+    }
+
+    private suspend fun connectAndInit(
+        address: String,
+        session: ElmSession,
+        autoConnect: Boolean,
+    ): Boolean {
         val manager = getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
         val bluetoothAdapter = manager?.adapter
         if (bluetoothAdapter == null || !bluetoothAdapter.isEnabled) {
@@ -302,15 +405,21 @@ class TripService : Service() {
             return false
         }
 
-        client.connect(device)?.let { error ->
-            TripSession.setStatus(ConnectionState.ERROR, "Адаптер: $error")
+        client.connect(device, autoConnect = autoConnect)?.let { error ->
+            TripSession.setStatus(
+                if (autoConnect) ConnectionState.WAITING else ConnectionState.ERROR,
+                "Адаптер: $error",
+            )
             Logger.error("подключение к адаптеру: $error")
             return false
         }
 
         TripSession.setStatus(ConnectionState.INITIALIZING, "Настраиваю ELM327…")
         session.initialize()?.let { error ->
-            TripSession.setStatus(ConnectionState.ERROR, "ELM327: $error")
+            TripSession.setStatus(
+                if (autoConnect) ConnectionState.WAITING else ConnectionState.ERROR,
+                "ELM327: $error",
+            )
             Logger.error("инициализация: $error")
             client.close()
             return false
@@ -318,29 +427,46 @@ class TripService : Service() {
         return true
     }
 
-    private suspend fun finishTrip(tripId: Long, stats: TripStats) {
-        val trip = dao.trip(tripId) ?: return
-        dao.updateTrip(
-            trip.copy(
-                finishedAt = System.currentTimeMillis(),
-                distanceMeters = stats.distanceMeters,
-                fuelLiters = stats.fuelLiters,
-                maxSpeedKmh = stats.maxSpeedKmh,
-                movingMillis = stats.movingMillis,
-                idleMillis = stats.idleMillis,
-            ),
-        )
+    /** Закрывает поездку, если связь не вернулась в отведённое окно. */
+    private suspend fun finalizeIfStale(trip: ActiveTrip?): ActiveTrip? {
+        if (trip == null) return null
+        if (System.currentTimeMillis() - trip.lastDataAt <= RESUME_WINDOW_MS) return trip
+        closeTrip(trip)
+        return null
+    }
+
+    /** Дописывает хвост точек и проставляет итоги. */
+    private suspend fun closeTrip(trip: ActiveTrip?) {
+        if (trip == null) return
+        if (trip.pending.isNotEmpty()) {
+            runCatching { dao.insertPoints(trip.pending.toList()) }
+            trip.pending.clear()
+        }
+        val stats = trip.accumulator.stats
+        val stored = dao.trip(trip.id) ?: return
+        runCatching {
+            dao.updateTrip(
+                stored.copy(
+                    finishedAt = System.currentTimeMillis(),
+                    distanceMeters = stats.distanceMeters,
+                    fuelLiters = stats.fuelLiters,
+                    maxSpeedKmh = stats.maxSpeedKmh,
+                    movingMillis = stats.movingMillis,
+                    idleMillis = stats.idleMillis,
+                ),
+            )
+        }
         Logger.log(
-            "поездка $tripId завершена: %.1f км, %.2f л".format(
+            "поездка ${trip.id} завершена: %.1f км, %.2f л".format(
                 Locale.US,
                 stats.distanceMeters / 1000,
                 stats.fuelLiters,
             ),
         )
-        withContext(Dispatchers.IO) { runCatching { dao.deleteEmptyTrips() } }
+        runCatching { dao.deleteEmptyTrips() }
     }
 
-    private fun stopRecording(status: String?) {
+    private fun stopEverything(status: String?) {
         worker?.cancel()
         worker = null
         locationSource.stop()
@@ -348,13 +474,6 @@ class TripService : Service() {
         releaseWakeLock()
         if (status != null) TripSession.setStatus(ConnectionState.IDLE, status)
         ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
-    }
-
-    private fun stopSelfSafely() {
-        locationSource.stop()
-        runCatching { client.close() }
-        releaseWakeLock()
-        stopSelf()
     }
 
     // --- Обвязка ------------------------------------------------------------
@@ -405,12 +524,12 @@ class TripService : Service() {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("Запись поездки")
+            .setContentTitle("OBD Trip Map")
             .setContentText(text)
             .setSmallIcon(R.drawable.ic_route)
             .setOngoing(true)
             .setContentIntent(open)
-            .addAction(0, "Завершить", stop)
+            .addAction(0, "Остановить", stop)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .build()
     }

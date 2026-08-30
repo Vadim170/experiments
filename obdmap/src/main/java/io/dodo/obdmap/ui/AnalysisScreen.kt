@@ -53,8 +53,11 @@ fun AnalysisScreen() {
         }
     }
 
-    var speedRange by remember { mutableStateOf(0f..140f) }
-    var maxAcceleration by remember { mutableStateOf(ConsumptionStats.STEADY_ACCELERATION_MS2.toFloat()) }
+    // Ниже 20 км/ч мгновенный л/100 км почти бессмысленен: делим на околоноль
+    var speedRange by remember { mutableStateOf(20f..140f) }
+    var maxAcceleration by remember {
+        mutableStateOf(ConsumptionStats.STEADY_ACCELERATION_MS2.toFloat())
+    }
     var filterByAcceleration by remember { mutableStateOf(true) }
 
     val samples = all
@@ -95,8 +98,11 @@ fun AnalysisScreen() {
             binKmh = SPEED_BIN_KMH,
         )
     }
+    // Обрезаем края: без фильтра по ускорению в выборку попадают разгоны с
+    // расходом в десятки л/100 км, и гистограмма по сырому min..max
+    // превращалась в пустой прямоугольник из сотен корзин.
     val histogram = remember(filtered) {
-        ConsumptionStats.histogram(filtered.map { it.litersPer100Km }, binWidth = HISTOGRAM_BIN)
+        ConsumptionStats.trimmedHistogram(filtered.map { it.litersPer100Km })
     }
 
     Column(
@@ -137,7 +143,8 @@ fun AnalysisScreen() {
                     )
                     Text(
                         "Замеры без известного ускорения при этом фильтре отбрасываются: " +
-                            "они могли быть разгоном.",
+                            "они могли быть разгоном. Выключи фильтр, чтобы увидеть всё " +
+                            "подряд, включая разгоны и торможения.",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -156,7 +163,9 @@ fun AnalysisScreen() {
                 Spacer(Modifier.height(8.dp))
                 if (filtered.size < ConsumptionStats.MIN_BIN_COUNT) {
                     Text(
-                        "Слишком мало замеров — расширь диапазон или ослабь фильтр.",
+                        text = "Слишком мало замеров. Расширь диапазон скорости, " +
+                            "ослабь фильтр по ускорению или запиши больше поездок. " +
+                            "Всего замеров с расходом в истории: ${samples.size}.",
                         style = MaterialTheme.typography.bodyMedium,
                     )
                 } else {
@@ -227,7 +236,6 @@ fun AnalysisScreen() {
 }
 
 private const val SPEED_BIN_KMH = 10.0
-private const val HISTOGRAM_BIN = 0.5
 
 @Composable
 private fun Stat(title: String, value: Double?) {

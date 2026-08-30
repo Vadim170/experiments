@@ -71,6 +71,13 @@ class ElmBleClient(private val context: Context) : ElmIo {
     @Volatile
     private var connectionStep: CompletableDeferred<Boolean>? = null
 
+    /**
+     * Ждём ли первого подключения в режиме autoConnect. Пока ждём, разрывы
+     * игнорируем: стек сам повторяет попытки, пока адаптер не появится.
+     */
+    @Volatile
+    private var awaitingAutoConnect = false
+
     @Volatile
     private var writeStep: CompletableDeferred<Boolean>? = null
 
@@ -79,19 +86,35 @@ class ElmBleClient(private val context: Context) : ElmIo {
 
     // --- Подключение --------------------------------------------------------
 
-    /** @return null при успехе, иначе текст ошибки. */
-    suspend fun connect(device: BluetoothDevice): String? {
+    /**
+     * @param autoConnect ждать появления адаптера сколько потребуется. Так
+     *   работает автоматический старт поездки: стек сам подключится, когда
+     *   адаптер запитается от разъёма OBD-II. Ожидание прерывается только
+     *   отменой корутины.
+     * @return null при успехе, иначе текст ошибки.
+     */
+    suspend fun connect(device: BluetoothDevice, autoConnect: Boolean = false): String? {
         close()
 
         val connectDeferred = CompletableDeferred<Boolean>()
         connectionStep = connectDeferred
+        awaitingAutoConnect = autoConnect
 
         val newGatt = runCatching {
-            device.connectGatt(context, false, callback, BluetoothDevice.TRANSPORT_LE)
-        }.getOrNull() ?: return "не удалось открыть GATT"
+            device.connectGatt(context, autoConnect, callback, BluetoothDevice.TRANSPORT_LE)
+        }.getOrNull() ?: run {
+            awaitingAutoConnect = false
+            return "не удалось открыть GATT"
+        }
         gatt = newGatt
 
-        if (withTimeoutOrNull(CONNECT_TIMEOUT_MS) { connectDeferred.await() } != true) {
+        val connected = if (autoConnect) {
+            connectDeferred.await()
+        } else {
+            withTimeoutOrNull(CONNECT_TIMEOUT_MS) { connectDeferred.await() } == true
+        }
+        awaitingAutoConnect = false
+        if (!connected) {
             close()
             return "адаптер не подключился"
         }
@@ -189,6 +212,7 @@ class ElmBleClient(private val context: Context) : ElmIo {
 
     fun close() {
         _connected.value = false
+        awaitingAutoConnect = false
         pending?.completeExceptionally(IOException("соединение закрыто"))
         pending = null
         writeCharacteristic = null
@@ -293,7 +317,9 @@ class ElmBleClient(private val context: Context) : ElmIo {
 
                 BluetoothProfile.STATE_DISCONNECTED -> {
                     _connected.value = false
-                    connectionStep?.complete(false)
+                    // В режиме ожидания разрыв — норма: адаптер ещё не запитан,
+                    // стек продолжит попытки сам.
+                    if (!awaitingAutoConnect) connectionStep?.complete(false)
                     pending?.completeExceptionally(IOException("адаптер отключился, status=$status"))
                     pending = null
                     Logger.log("ELM327 отключился, status=$status")

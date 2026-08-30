@@ -4,6 +4,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.viewinterop.AndroidView
 import io.dodo.obdmap.analysis.TrackPalette
@@ -71,7 +72,9 @@ fun TrackMap(
     val drawn = remember(points, mode) { decimate(points, MAX_DRAWN_POINTS) }
 
     AndroidView(
-        modifier = modifier,
+        // Без clipToBounds osmdroid рисует тайлы за пределами отведённой области
+        // и налезает на соседние элементы экрана.
+        modifier = modifier.clipToBounds(),
         factory = { mapView },
         update = { view ->
             view.overlays.clear()

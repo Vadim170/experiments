@@ -7,6 +7,9 @@ import kotlinx.coroutines.flow.StateFlow
 /** Стадия работы с адаптером — по ней экран решает, что показывать. */
 enum class ConnectionState {
     IDLE,
+
+    /** Автоматический режим: адаптера ещё нет или мотор не заведён. */
+    WAITING,
     CONNECTING,
     INITIALIZING,
     LIVE,

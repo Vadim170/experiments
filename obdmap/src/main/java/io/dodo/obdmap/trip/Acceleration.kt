@@ -16,8 +16,12 @@ class AccelerationTracker(
     companion object {
         const val DEFAULT_WINDOW_MS = 1_500L
 
-        /** Короче этого промежутка наклон считать бессмысленно — один шум. */
-        const val DEFAULT_MIN_SPAN_MS = 700L
+        /**
+         * Короче этого промежутка наклон считать бессмысленно — один шум.
+         * Держим невысоким: на экране ускорение должно появляться через
+         * секунду после старта, а не через несколько.
+         */
+        const val DEFAULT_MIN_SPAN_MS = 400L
     }
 
     private val times = ArrayDeque<Long>()
@@ -42,7 +46,7 @@ class AccelerationTracker(
         }
 
         val span = times.last() - times.first()
-        if (times.size < 3 || span < minSpanMs) return null
+        if (times.size < 2 || span < minSpanMs) return null
         return slope()
     }
 

@@ -28,6 +28,10 @@ internal object Fmt {
     fun litersPerHour(value: Double?): String =
         value?.let { String.format(Locale.US, "%.2f л/ч", it) } ?: "—"
 
+    /** Только число, без единиц: для крупных плиток, где единица подписана снизу. */
+    fun number(value: Double?, decimals: Int = 1): String =
+        value?.let { String.format(Locale.US, "%.${decimals}f", it) } ?: "—"
+
     fun liters(value: Double): String = String.format(Locale.US, "%.2f л", value)
 
     fun percent(value: Double?): String =

@@ -11,6 +11,7 @@ object Prefs {
     private const val KEY_ADAPTER_NAME = "adapter_name"
     private const val KEY_DISPLACEMENT = "displacement_l"
     private const val KEY_COLOR_MODE = "color_mode"
+    private const val KEY_AUTO_MODE = "auto_mode"
     private const val KEY_SPEED_THRESHOLDS = "speed_thresholds"
 
     fun adapterAddress(context: Context): String? =
@@ -32,6 +33,13 @@ object Prefs {
 
     fun setDisplacementLiters(context: Context, value: Float) {
         prefs(context).edit().putFloat(KEY_DISPLACEMENT, value).apply()
+    }
+
+    /** Автоматический старт и стоп поездок. */
+    fun autoMode(context: Context): Boolean = prefs(context).getBoolean(KEY_AUTO_MODE, false)
+
+    fun setAutoMode(context: Context, value: Boolean) {
+        prefs(context).edit().putBoolean(KEY_AUTO_MODE, value).apply()
     }
 
     /** Чем красить траекторию: имя элемента TrackPalette.Mode. */

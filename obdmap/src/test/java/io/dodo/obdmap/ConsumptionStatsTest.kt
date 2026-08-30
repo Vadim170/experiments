@@ -134,3 +134,66 @@ class ConsumptionStatsTest {
         assertEquals(6.15, steady.single().median, 0.1)
     }
 }
+
+/** Отдельно — то, из-за чего экран анализа показывал пустоту без фильтра. */
+class TrimmedHistogramTest {
+
+    private fun sample(speed: Double, consumption: Double, acceleration: Double? = 0.0) =
+        DriveSample(speed, consumption, acceleration)
+
+    @Test
+    fun `выбросы у отсечки скорости не попадают в выборку`() {
+        val samples = listOf(
+            sample(4.0, 400.0),
+            sample(60.0, 6.0),
+            sample(60.0, 7.0),
+        )
+        val filtered = ConsumptionStats.filter(samples, 0.0, 200.0)
+        assertEquals(2, filtered.size)
+        assertTrue(filtered.none { it.litersPer100Km > ConsumptionStats.MAX_PLAUSIBLE_L100 })
+    }
+
+    @Test
+    fun `гистограмма не разваливается на тысячу корзин из-за одного выброса`() {
+        val values = List(200) { 6.0 + it % 10 * 0.1 } + listOf(500.0)
+        val naive = ConsumptionStats.histogram(values, 0.5)
+        val trimmed = ConsumptionStats.trimmedHistogram(values)
+        assertTrue("наивная гистограмма и должна быть огромной: ${naive.size}", naive.size > 500)
+        assertTrue("после обрезки корзин должно быть немного: ${trimmed.size}", trimmed.size <= 60)
+        assertTrue(trimmed.sumOf { it.count } > 150)
+    }
+
+    @Test
+    fun `шаг гистограммы человеческий`() {
+        assertEquals(1.0, ConsumptionStats.niceStep(0.9), 0.0001)
+        assertEquals(2.0, ConsumptionStats.niceStep(1.4), 0.0001)
+        assertEquals(5.0, ConsumptionStats.niceStep(4.2), 0.0001)
+        assertEquals(0.5, ConsumptionStats.niceStep(0.31), 0.0001)
+        // 0.05 — это 5·10⁻², такой же «круглый» шаг, как 5 или 50
+        assertEquals(0.05, ConsumptionStats.niceStep(0.05), 0.0001)
+        assertEquals(0.05, ConsumptionStats.niceStep(0.042), 0.0001)
+    }
+
+    @Test
+    fun `без фильтра по ускорению данных больше а не меньше`() {
+        // Ровно та жалоба: анализ работал только со «стабильной скоростью»
+        val samples = buildList {
+            repeat(50) { add(sample(60.0, 6.0 + it * 0.02, acceleration = 0.05)) }
+            repeat(50) { add(sample(60.0, 12.0 + it * 0.05, acceleration = 1.5)) }
+        }
+        val steady = ConsumptionStats.filter(samples, 0.0, 200.0, 0.2)
+        val everything = ConsumptionStats.filter(samples, 0.0, 200.0, null)
+        assertTrue(everything.size > steady.size)
+
+        val bins = ConsumptionStats.trimmedHistogram(everything.map { it.litersPer100Km })
+        assertTrue("гистограмма без фильтра не должна быть пустой", bins.isNotEmpty())
+        assertTrue(bins.sumOf { it.count } > 80)
+    }
+
+    @Test
+    fun `одинаковые значения не ломают обрезку`() {
+        val bins = ConsumptionStats.trimmedHistogram(List(50) { 7.0 })
+        assertTrue(bins.isNotEmpty())
+        assertEquals(50, bins.sumOf { it.count })
+    }
+}

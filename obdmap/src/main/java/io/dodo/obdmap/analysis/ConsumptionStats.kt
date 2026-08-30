@@ -40,6 +40,15 @@ object ConsumptionStats {
     const val MIN_BIN_COUNT = 5
 
     /**
+     * Максимальный правдоподобный мгновенный расход, л/100 км.
+     *
+     * У самой границы отсечки по скорости величина улетает в сотни: это не
+     * данные, а деление на почти ноль. Такие замеры портят и гистограмму,
+     * и медианы, поэтому отсекаются на входе.
+     */
+    const val MAX_PLAUSIBLE_L100 = 60.0
+
+    /**
      * Отбор замеров.
      *
      * @param maxAbsAcceleration порог |a|; null — не фильтровать по ускорению
@@ -54,11 +63,65 @@ object ConsumptionStats {
         maxAbsAcceleration: Double? = null,
         requireAcceleration: Boolean = true,
     ): List<DriveSample> = samples.filter { sample ->
+        if (sample.litersPer100Km > MAX_PLAUSIBLE_L100) return@filter false
         if (sample.speedKmh < minSpeedKmh || sample.speedKmh > maxSpeedKmh) return@filter false
         if (maxAbsAcceleration == null) return@filter true
         val acceleration = sample.accelerationMs2
             ?: return@filter !requireAcceleration
         abs(acceleration) <= maxAbsAcceleration
+    }
+
+    /**
+     * Гистограмма по «рабочему» диапазону значений, с автоматическим шагом.
+     *
+     * Считать по сырому min..max нельзя: мгновенный расход у самой границы
+     * отсечки (3 км/ч) улетает в сотни л/100 км, и гистограмма из тысячи
+     * корзин превращается в пустой прямоугольник. Поэтому края обрезаются по
+     * перцентилям, а число корзин фиксировано.
+     *
+     * @param targetBins сколько корзин хотим получить
+     * @param trim какую долю отбрасывать с каждого края
+     */
+    fun trimmedHistogram(
+        values: List<Double>,
+        targetBins: Int = DEFAULT_BINS,
+        trim: Double = DEFAULT_TRIM,
+    ): List<HistogramBin> {
+        if (values.size < 2 || targetBins < 1) return histogram(values, 1.0)
+        val low = percentile(values, trim) ?: return emptyList()
+        val high = percentile(values, 1 - trim) ?: return emptyList()
+        if (high <= low) return histogram(values, 1.0)
+
+        val inRange = values.filter { it in low..high }
+        if (inRange.isEmpty()) return emptyList()
+
+        val width = niceStep((high - low) / targetBins)
+        return histogram(inRange, width)
+    }
+
+    /** Доля значений, отбрасываемая с каждого края перед построением гистограммы. */
+    const val DEFAULT_TRIM = 0.02
+
+    /** Целевое число корзин гистограммы. */
+    const val DEFAULT_BINS = 30
+
+    /**
+     * Округляет шаг до «человеческого»: 0.1 / 0.2 / 0.5 / 1 / 2 / 5 …
+     * Иначе подписи под гистограммой получаются вида 0.4713.
+     */
+    fun niceStep(raw: Double): Double {
+        if (raw <= 0) return 1.0
+        var magnitude = 1.0
+        while (magnitude > raw) magnitude /= 10
+        while (magnitude * 10 <= raw) magnitude *= 10
+        val normalized = raw / magnitude
+        val step = when {
+            normalized <= 1.0 -> 1.0
+            normalized <= 2.0 -> 2.0
+            normalized <= 5.0 -> 5.0
+            else -> 10.0
+        }
+        return step * magnitude
     }
 
     /** Гистограмма значений с шагом [binWidth]; пустые корзины внутри диапазона сохраняются. */

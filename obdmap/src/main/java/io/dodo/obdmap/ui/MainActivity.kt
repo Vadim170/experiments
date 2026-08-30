@@ -28,6 +28,7 @@ class MainActivity : ComponentActivity() {
     // остаётся заблокированной до перезапуска приложения.
     private var adapterAddress by mutableStateOf<String?>(null)
     private var adapterName by mutableStateOf<String?>(null)
+    private var autoMode by mutableStateOf(false)
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions(),
@@ -56,12 +57,14 @@ class MainActivity : ComponentActivity() {
                     permissionsGranted = permissionsGranted,
                     savedAdapterName = adapterName,
                     savedAdapterAddress = adapterAddress,
+                    autoMode = autoMode,
                     onRequestPermissions = ::requestPermissions,
                     onPickAdapter = { address, name ->
                         Prefs.setAdapter(this, address, name)
                         refreshAdapter()
                         picker.stopScan()
                     },
+                    onSetAutoMode = ::changeAutoMode,
                     onStart = ::startRecording,
                     onStop = { TripService.stop(this) },
                     onStartScan = {
@@ -87,6 +90,27 @@ class MainActivity : ComponentActivity() {
     private fun refreshAdapter() {
         adapterAddress = Prefs.adapterAddress(this)
         adapterName = Prefs.adapterName(this)
+        autoMode = Prefs.autoMode(this)
+    }
+
+    /**
+     * Включение автоматического режима сразу поднимает сервис: он ждёт адаптер
+     * и сам открывает поездку. Выключение — останавливает.
+     */
+    private fun changeAutoMode(enabled: Boolean) {
+        Prefs.setAutoMode(this, enabled)
+        autoMode = enabled
+        if (enabled) {
+            if (!permissionsGranted) {
+                requestPermissions()
+                return
+            }
+            if (!ensureBluetoothOn()) return
+            val address = adapterAddress ?: return
+            TripService.start(this, address, auto = true)
+        } else {
+            TripService.stop(this)
+        }
     }
 
     override fun onPause() {
@@ -99,23 +123,29 @@ class MainActivity : ComponentActivity() {
             requestPermissions()
             return
         }
-        val adapter = getSystemService(BluetoothManager::class.java)?.adapter
-        if (adapter == null) {
-            Logger.error("на устройстве нет Bluetooth")
-            return
-        }
-        if (!adapter.isEnabled) {
-            runCatching {
-                enableBluetoothLauncher.launch(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE))
-            }
-            return
-        }
+        if (!ensureBluetoothOn()) return
         val address = adapterAddress
         if (address == null) {
             Logger.error("адаптер не выбран")
             return
         }
-        TripService.start(this, address)
+        TripService.start(this, address, auto = false)
+    }
+
+    /** @return true, если Bluetooth уже включён; иначе просит пользователя включить. */
+    private fun ensureBluetoothOn(): Boolean {
+        val adapter = getSystemService(BluetoothManager::class.java)?.adapter
+        if (adapter == null) {
+            Logger.error("на устройстве нет Bluetooth")
+            return false
+        }
+        if (!adapter.isEnabled) {
+            runCatching {
+                enableBluetoothLauncher.launch(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE))
+            }.onFailure { Logger.error("не смог попросить включить Bluetooth", it) }
+            return false
+        }
+        return true
     }
 
     private fun refreshPermissions() {
