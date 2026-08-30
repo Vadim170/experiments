@@ -1,6 +1,7 @@
 package io.dodo.obdmap.obd
 
 import io.dodo.obdmap.util.Logger
+import kotlinx.coroutines.delay
 
 /** Откуда берём расход топлива — зависит от того, что поддерживает блок. */
 enum class FuelSource {
@@ -74,6 +75,12 @@ class ElmSession(private val io: ElmIo) {
             "3" to "ISO 9141-2",
         )
 
+        /** Сколько ждём, пока адаптер домолчит после ATZ. */
+        const val AFTER_RESET_SETTLE_MS = 700L
+
+        /** Пауза перед повтором потерянной команды. */
+        const val RETRY_PAUSE_MS = 300L
+
         /** Автопоиску даём две попытки: первая часто уходит на SEARCHING. */
         const val AUTO_PROBE_ATTEMPTS = 2
 
@@ -137,10 +144,15 @@ class ElmSession(private val io: ElmIo) {
         // Версия прошивки в баннере — первое, что нужно знать про клон
         Logger.log("ELM ATZ -> ${clean(banner)}")
 
+        // После сброса клон ещё какое-то время досылает баннер и мусор.
+        // Если это не выбросить, хвост достанется следующей команде, ответы
+        // разъедутся на одну, и очередная будет ждать уже съеденный ответ.
+        delay(AFTER_RESET_SETTLE_MS)
+        io.flush()
+
         INIT_COMMANDS.forEach { (command, description) ->
-            val response = runCatching { io.send(command) }
-                .getOrElse { return "$description: ${it.message}" }
-            // На ATZ-эхо и мусор в буфере не ругаемся: важно, что адаптер отвечает.
+            val response = sendWithRetry(command)
+                ?: return "$description: адаптер не ответил"
             Logger.log("ELM $command -> ${clean(response)}")
         }
 
@@ -153,6 +165,20 @@ class ElmSession(private val io: ElmIo) {
     }
 
     /**
+     * Отправляет команду, при неудаче — ещё раз после сброса буфера.
+     *
+     * Один потерянный ответ у клона не редкость, а вся инициализация из-за
+     * него валится целиком.
+     */
+    private suspend fun sendWithRetry(command: String, timeoutMs: Long = ElmIo.DEFAULT_TIMEOUT_MS): String? {
+        runCatching { io.send(command, timeoutMs) }.onSuccess { return it }
+            .onFailure { Logger.log("ELM $command не ответил, повторяю: ${it.message}") }
+        io.flush()
+        delay(RETRY_PAUSE_MS)
+        return runCatching { io.send(command, timeoutMs) }.getOrNull()
+    }
+
+    /**
      * Поднимает шину, перебирая протоколы. Успехом считаем не «нет ошибки», а
      * разобранный ответ на 0100: клоны умеют отвечать мусором без слова ERROR.
      *
@@ -162,7 +188,7 @@ class ElmSession(private val io: ElmIo) {
         val command = Pids.command(Pids.SUPPORTED_01_20)
 
         PROTOCOLS.forEach { (code, title) ->
-            val set = runCatching { io.send("ATSP$code") }.getOrNull()
+            val set = sendWithRetry("ATSP$code")
             if (set == null) {
                 Logger.error("не удалось задать протокол $title")
                 return@forEach

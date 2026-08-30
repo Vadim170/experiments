@@ -106,6 +106,18 @@ fun AnalysisScreen() {
     // Обрезаем края: без фильтра по ускорению в выборку попадают разгоны с
     // расходом в десятки л/100 км, и гистограмма по сырому min..max
     // превращалась в пустой прямоугольник из сотен корзин.
+    // Сколько замеров вообще знают своё ускорение. Точки старых поездок
+    // записаны до его появления, у них null — и жёсткий фильтр выкидывает их все.
+    val withAcceleration = remember(samples) { samples.count { it.accelerationMs2 != null } }
+    val inSpeedRange = remember(samples, speedRange) {
+        ConsumptionStats.filter(
+            samples = samples,
+            minSpeedKmh = speedRange.start.toDouble(),
+            maxSpeedKmh = speedRange.endInclusive.toDouble(),
+            maxAbsAcceleration = null,
+        ).size
+    }
+
     val histogram = remember(filtered, histogramStep) {
         ConsumptionStats.trimmedHistogram(
             values = filtered.map { it.litersPer100Km },
@@ -159,6 +171,14 @@ fun AnalysisScreen() {
                 }
             }
         }
+
+        SampleSummary(
+            total = samples.size,
+            inSpeedRange = inSpeedRange,
+            withAcceleration = withAcceleration,
+            afterFilters = filtered.size,
+            filterOn = filterByAcceleration,
+        )
 
         Card(Modifier.fillMaxWidth()) {
             Column(Modifier.padding(12.dp)) {
@@ -222,9 +242,17 @@ fun AnalysisScreen() {
                     format = { Fmt.number(it, decimals = 0) },
                 )
                 Spacer(Modifier.height(8.dp))
-                if (bySpeed.size < 2) {
+                if (bySpeed.isEmpty()) {
                     Text(
-                        "Пока не хватает данных: нужны замеры хотя бы в двух диапазонах скорости.",
+                        text = "Ни в один диапазон не набралось " +
+                            "${ConsumptionStats.MIN_BIN_COUNT} замеров. Возьми шаг покрупнее " +
+                            "или ослабь фильтр по ускорению.",
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                } else if (bySpeed.size < 2) {
+                    // График по одной точке бессмысленен, но цифру показать честно
+                    Text(
+                        "Пока набрался один диапазон — графика нет, но цифры ниже верны.",
                         style = MaterialTheme.typography.bodyMedium,
                     )
                 } else {
@@ -234,6 +262,8 @@ fun AnalysisScreen() {
                         bandColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.2f),
                         modifier = Modifier.fillMaxWidth().height(180.dp),
                     )
+                }
+                if (bySpeed.isNotEmpty()) {
                     Spacer(Modifier.height(8.dp))
                     bySpeed.forEach { bin ->
                         Row(
@@ -256,13 +286,49 @@ fun AnalysisScreen() {
     }
 }
 
-private const val SPEED_BIN_KMH = 10.0
+/**
+ * Сводка по выборке: сколько замеров осталось после каждого сита.
+ * Без неё «данных не хватает» ничего не объясняет.
+ */
+@Composable
+private fun SampleSummary(
+    total: Int,
+    inSpeedRange: Int,
+    withAcceleration: Int,
+    afterFilters: Int,
+    filterOn: Boolean,
+) {
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(12.dp)) {
+            Text("Что в выборке", style = MaterialTheme.typography.titleSmall)
+            Text(
+                text = "всего замеров с расходом: $total\n" +
+                    "в диапазоне скорости: $inSpeedRange\n" +
+                    "с известным ускорением: $withAcceleration\n" +
+                    "после всех фильтров: $afterFilters",
+                style = MaterialTheme.typography.bodySmall,
+            )
+            if (filterOn && withAcceleration == 0 && total > 0) {
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    text = "Ни у одного замера нет ускорения — поездки записаны до того, " +
+                        "как оно появилось. С включённым фильтром они все отбрасываются: " +
+                        "выключи фильтр или запиши новую поездку.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
+            }
+        }
+    }
+}
+
+private const val SPEED_BIN_KMH = 5.0
 
 /** Шаги гистограммы расхода; null — автоматический подбор. */
 private val HISTOGRAM_STEPS = listOf(null, 0.2, 0.5, 1.0, 2.0)
 
-/** Шаги корзин по скорости. Без «авто»: тут шаг — это осмысленный выбор. */
-private val SPEED_STEPS = listOf(5.0, 10.0, 20.0)
+/** Шаги корзин по скорости. Крупнее 5 км/ч смысла нет — картина смазывается. */
+private val SPEED_STEPS = listOf(1.0, 2.0, 5.0)
 
 /**
  * Ряд чипов для выбора шага. [selected] == null означает автоматический

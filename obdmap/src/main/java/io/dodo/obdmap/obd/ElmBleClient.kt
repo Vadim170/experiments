@@ -245,9 +245,18 @@ class ElmBleClient(private val context: Context) : ElmIo {
         val response = withTimeoutOrNull(timeoutMs) { deferred.await() }
         if (response == null) {
             pending = null
+            // Буфер мог наполниться наполовину — иначе хвост уйдёт следующей команде
+            synchronized(buffer) { buffer.setLength(0) }
             throw IOException("таймаут ответа на $command")
         }
-        return response
+        // Хвост предыдущей команды мог приехать вместе с нашим ответом
+        return ObdParser.lastResponse(response)
+    }
+
+    override suspend fun flush() {
+        synchronized(buffer) { buffer.setLength(0) }
+        pending?.completeExceptionally(IOException("буфер сброшен"))
+        pending = null
     }
 
     private suspend fun writeChunk(
