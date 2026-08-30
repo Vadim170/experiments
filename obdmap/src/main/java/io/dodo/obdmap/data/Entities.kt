@@ -43,4 +43,6 @@ data class PointEntity(
     val rpm: Double? = null,
     val fuelRateLitersPerHour: Double? = null,
     val litersPer100Km: Double? = null,
+    /** Ускорение в этот момент, м/с². Считается по окну замеров скорости. */
+    val accelerationMs2: Double? = null,
 )

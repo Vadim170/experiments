@@ -23,6 +23,12 @@ class MainActivity : ComponentActivity() {
 
     private var permissionsGranted by mutableStateOf(false)
 
+    // Адрес адаптера держим состоянием, а не читаем из Prefs при сборке экрана:
+    // иначе после выбора устройства экран не перерисовывается и кнопка старта
+    // остаётся заблокированной до перезапуска приложения.
+    private var adapterAddress by mutableStateOf<String?>(null)
+    private var adapterName by mutableStateOf<String?>(null)
+
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions(),
     ) { result ->
@@ -41,17 +47,19 @@ class MainActivity : ComponentActivity() {
         Logger.init(applicationContext)
         picker = AdapterPicker(applicationContext)
         refreshPermissions()
+        refreshAdapter()
 
         setContent {
             AppTheme {
                 AppScreen(
                     picker = picker,
                     permissionsGranted = permissionsGranted,
-                    savedAdapterName = Prefs.adapterName(this),
-                    savedAdapterAddress = Prefs.adapterAddress(this),
+                    savedAdapterName = adapterName,
+                    savedAdapterAddress = adapterAddress,
                     onRequestPermissions = ::requestPermissions,
                     onPickAdapter = { address, name ->
                         Prefs.setAdapter(this, address, name)
+                        refreshAdapter()
                         picker.stopScan()
                     },
                     onStart = ::startRecording,
@@ -73,6 +81,12 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         refreshPermissions()
+        refreshAdapter()
+    }
+
+    private fun refreshAdapter() {
+        adapterAddress = Prefs.adapterAddress(this)
+        adapterName = Prefs.adapterName(this)
     }
 
     override fun onPause() {
@@ -96,7 +110,7 @@ class MainActivity : ComponentActivity() {
             }
             return
         }
-        val address = Prefs.adapterAddress(this)
+        val address = adapterAddress
         if (address == null) {
             Logger.error("адаптер не выбран")
             return

@@ -6,6 +6,13 @@ import androidx.room.Query
 import androidx.room.Update
 import kotlinx.coroutines.flow.Flow
 
+/** Узкая проекция точки для экрана анализа. */
+data class DriveRow(
+    val speedKmh: Double,
+    val litersPer100Km: Double,
+    val accelerationMs2: Double?,
+)
+
 @Dao
 interface TripDao {
 
@@ -36,4 +43,23 @@ interface TripDao {
     /** Поездки без единой точки только засоряют список — чистим при старте. */
     @Query("DELETE FROM trips WHERE id NOT IN (SELECT DISTINCT tripId FROM points)")
     suspend fun deleteEmptyTrips()
+
+    /**
+     * Замеры для анализа расхода: только те, где есть и скорость, и расход.
+     * Тянем узкую проекцию — точек за месяц езды набирается очень много.
+     *
+     * @param tripId null — по всей истории, иначе по одной поездке
+     */
+    @Query(
+        """
+        SELECT speedKmh AS speedKmh,
+               litersPer100Km AS litersPer100Km,
+               accelerationMs2 AS accelerationMs2
+        FROM points
+        WHERE speedKmh IS NOT NULL
+          AND litersPer100Km IS NOT NULL
+          AND (:tripId IS NULL OR tripId = :tripId)
+        """,
+    )
+    suspend fun driveRows(tripId: Long?): List<DriveRow>
 }

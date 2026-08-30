@@ -170,6 +170,7 @@ class TripService : Service() {
         Logger.log("поездка $tripId начата, расход по: ${session.fuelSource.title}")
 
         val accumulator = TripAccumulator()
+        val acceleration = AccelerationTracker()
         val pending = mutableListOf<PointEntity>()
         var cycle = 0
         var reconnects = 0
@@ -197,6 +198,7 @@ class TripService : Service() {
                 val now = System.currentTimeMillis()
                 val snapshot = session.readSnapshot(now, includeSlow = cycle % SLOW_EVERY == 0)
                 val location = locationSource.current()
+                val accelerationMs2 = acceleration.add(now, snapshot.speedKmh)
 
                 val sample = TripSample(
                     timeMs = now,
@@ -221,6 +223,9 @@ class TripService : Service() {
                         litersPer100Km = instant,
                         fuelLevelPercent = snapshot.fuelLevelPercent ?: state.fuelLevelPercent,
                         coolantTempC = snapshot.coolantTempC ?: state.coolantTempC,
+                        accelerationMs2 = accelerationMs2 ?: state.accelerationMs2,
+                        fuelSource = session.fuelSource,
+                        diagnostics = session.diagnostics,
                         stats = accumulator.stats,
                         hasLocation = location != null,
                     )
@@ -234,9 +239,20 @@ class TripService : Service() {
                             longitude = location.longitude,
                             speedKmh = snapshot.speedKmh,
                             litersPer100Km = instant,
+                            accelerationMs2 = accelerationMs2,
                         ),
                     )
                 }
+
+                // График текущей поездки рисуем и без GPS: данные с шины идут
+                TripSession.addSample(
+                    LiveSample(
+                        timeMs = now,
+                        speedKmh = snapshot.speedKmh,
+                        litersPer100Km = instant,
+                        accelerationMs2 = accelerationMs2,
+                    ),
+                )
 
                 pending += PointEntity(
                     tripId = tripId,
@@ -247,6 +263,7 @@ class TripService : Service() {
                     rpm = snapshot.rpm,
                     fuelRateLitersPerHour = snapshot.fuelRateLitersPerHour,
                     litersPer100Km = instant,
+                    accelerationMs2 = accelerationMs2,
                 )
                 if (pending.size >= POINT_BATCH) {
                     dao.insertPoints(pending.toList())

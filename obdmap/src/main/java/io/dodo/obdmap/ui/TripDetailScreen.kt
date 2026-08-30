@@ -1,6 +1,5 @@
 package io.dodo.obdmap.ui
 
-import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -13,7 +12,9 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Card
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -21,19 +22,19 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.Path
-import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import io.dodo.obdmap.data.PointEntity
 import io.dodo.obdmap.data.TripDatabase
 import io.dodo.obdmap.data.TripEntity
+import io.dodo.obdmap.analysis.TrackPalette
 import io.dodo.obdmap.obd.FuelMath
+import io.dodo.obdmap.util.Prefs
 
 @Composable
 fun TripDetailScreen(tripId: Long, onBack: () -> Unit) {
@@ -44,6 +45,15 @@ fun TripDetailScreen(tripId: Long, onBack: () -> Unit) {
         mutableStateOf<Pair<TripEntity?, List<PointEntity>>?>(null)
     }
     LaunchedEffect(tripId) { loaded = dao.trip(tripId) to dao.points(tripId) }
+
+    var colorMode by rememberSaveable {
+        mutableStateOf(
+            Prefs.colorMode(context)
+                ?.let { runCatching { TrackPalette.Mode.valueOf(it) }.getOrNull() }
+                ?: TrackPalette.Mode.SPEED,
+        )
+    }
+    val speedThresholds = remember { Prefs.speedThresholds(context) }
 
     val data = loaded
     if (data == null) {
@@ -70,7 +80,17 @@ fun TripDetailScreen(tripId: Long, onBack: () -> Unit) {
             points.mapNotNull { point ->
                 val latitude = point.latitude
                 val longitude = point.longitude
-                if (latitude != null && longitude != null) MapPoint(latitude, longitude) else null
+                if (latitude != null && longitude != null) {
+                    MapPoint(
+                        latitude = latitude,
+                        longitude = longitude,
+                        speedKmh = point.speedKmh,
+                        litersPer100Km = point.litersPer100Km,
+                        accelerationMs2 = point.accelerationMs2,
+                    )
+                } else {
+                    null
+                }
             }
         }
 
@@ -83,11 +103,34 @@ fun TripDetailScreen(tripId: Long, onBack: () -> Unit) {
                 )
             }
         } else {
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                TrackPalette.Mode.entries.forEach { mode ->
+                    FilterChip(
+                        selected = colorMode == mode,
+                        onClick = {
+                            colorMode = mode
+                            Prefs.setColorMode(context, mode.name)
+                        },
+                        label = { Text(mode.title) },
+                    )
+                }
+            }
             TrackMap(
                 points = mapPoints,
+                mode = colorMode,
+                speedThresholds = speedThresholds,
                 modifier = Modifier.fillMaxWidth().height(320.dp).padding(12.dp),
                 fitAll = true,
             )
+            PaletteLegend(
+                mode = colorMode,
+                speedThresholds = speedThresholds,
+                modifier = Modifier.padding(horizontal = 12.dp),
+            )
+            MapCacheCard(Modifier.padding(12.dp))
         }
 
         Stats(trip)
@@ -102,6 +145,12 @@ fun TripDetailScreen(tripId: Long, onBack: () -> Unit) {
                 title = "Расход, л/100 км",
                 values = points.map { it.litersPer100Km },
                 color = MaterialTheme.colorScheme.tertiary,
+            )
+            SeriesCard(
+                title = "Ускорение, м/с² (середина — ноль)",
+                values = points.map { it.accelerationMs2?.plus(ACCEL_SHIFT) },
+                color = MaterialTheme.colorScheme.error,
+                maxOverride = ACCEL_SHIFT * 2,
             )
         }
 
@@ -145,46 +194,30 @@ private fun Cell(title: String, value: String) {
     }
 }
 
-/** Простой график по точкам поездки: без библиотек, обычный Canvas. */
+/** Карточка с графиком по точкам поездки. */
 @Composable
-private fun SeriesCard(title: String, values: List<Double?>, color: Color) {
+private fun SeriesCard(
+    title: String,
+    values: List<Double?>,
+    color: Color,
+    maxOverride: Double? = null,
+) {
     val present = remember(values) { values.filterNotNull() }
     if (present.isEmpty()) return
 
-    val maxValue = present.max().takeIf { it > 0 } ?: return
     Card(Modifier.fillMaxWidth().padding(12.dp)) {
         Column(Modifier.padding(12.dp)) {
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                Text(title, style = MaterialTheme.typography.titleSmall)
-                Text(
-                    "макс ${Fmt.litersPer100(maxValue)}",
-                    style = MaterialTheme.typography.bodySmall,
-                )
-            }
+            Text(title, style = MaterialTheme.typography.titleSmall)
             Spacer(Modifier.height(8.dp))
-            Canvas(Modifier.fillMaxWidth().height(120.dp)) {
-                val stepX = size.width / (values.size - 1).coerceAtLeast(1)
-                val path = Path()
-                var started = false
-                values.forEachIndexed { index, value ->
-                    if (value == null) {
-                        // Разрыв в данных не соединяем прямой — иначе график врёт
-                        started = false
-                        return@forEachIndexed
-                    }
-                    val x = index * stepX
-                    val y = size.height - (value / maxValue).toFloat() * size.height
-                    if (started) path.lineTo(x, y) else path.moveTo(x, y)
-                    started = true
-                }
-                drawPath(path, color, style = Stroke(width = 3f))
-                drawLine(
-                    color = color.copy(alpha = 0.25f),
-                    start = Offset(0f, size.height),
-                    end = Offset(size.width, size.height),
-                    strokeWidth = 2f,
-                )
-            }
+            SeriesChart(
+                values = values,
+                color = color,
+                modifier = Modifier.fillMaxWidth().height(120.dp),
+                maxOverride = maxOverride,
+            )
         }
     }
 }
+
+/** На сколько сдвигаем ускорение, чтобы отрицательные значения попали на график. */
+private const val ACCEL_SHIFT = 4.0

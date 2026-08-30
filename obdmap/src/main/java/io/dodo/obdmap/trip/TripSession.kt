@@ -20,6 +20,18 @@ data class TrackPoint(
     val longitude: Double,
     val speedKmh: Double? = null,
     val litersPer100Km: Double? = null,
+    val accelerationMs2: Double? = null,
+)
+
+/**
+ * Замер для графиков текущей поездки. Отдельно от [TrackPoint]: график должен
+ * рисоваться и когда GPS не ловится, а данные с шины идут.
+ */
+data class LiveSample(
+    val timeMs: Long,
+    val speedKmh: Double? = null,
+    val litersPer100Km: Double? = null,
+    val accelerationMs2: Double? = null,
 )
 
 /** Всё, что показывает экран поездки прямо сейчас. */
@@ -33,6 +45,9 @@ data class LiveState(
     val litersPer100Km: Double? = null,
     val fuelLevelPercent: Double? = null,
     val coolantTempC: Int? = null,
+    val accelerationMs2: Double? = null,
+    /** Что ответило при пробе PID расхода — видно на экране, чтобы не гадать. */
+    val diagnostics: String = "",
     val stats: TripStats = TripStats(),
     val tripId: Long? = null,
     val hasLocation: Boolean = false,
@@ -47,11 +62,19 @@ object TripSession {
     /** Больше точек карта всё равно не отрисует осмысленно, а память съест. */
     private const val MAX_TRACK_POINTS = 20_000
 
+    /** Глубина графиков текущей поездки. */
+    private const val MAX_SERIES = 4_000
+
     private val _live = MutableStateFlow(LiveState())
     val live: StateFlow<LiveState> = _live
 
     private val _track = MutableStateFlow<List<TrackPoint>>(emptyList())
     val track: StateFlow<List<TrackPoint>> = _track
+
+    private val _series = MutableStateFlow<List<LiveSample>>(emptyList())
+
+    /** История текущей поездки для графиков на главном экране. */
+    val series: StateFlow<List<LiveSample>> = _series
 
     fun update(transform: (LiveState) -> LiveState) {
         _live.value = transform(_live.value)
@@ -66,8 +89,14 @@ object TripSession {
         _track.value = if (next.size > MAX_TRACK_POINTS) next.takeLast(MAX_TRACK_POINTS) else next
     }
 
+    fun addSample(sample: LiveSample) {
+        val next = _series.value + sample
+        _series.value = if (next.size > MAX_SERIES) next.takeLast(MAX_SERIES) else next
+    }
+
     fun startNewTrip(tripId: Long) {
         _track.value = emptyList()
+        _series.value = emptyList()
         _live.value = LiveState(
             connection = ConnectionState.LIVE,
             status = "Идёт запись",
@@ -79,5 +108,6 @@ object TripSession {
     fun reset(status: String) {
         _live.value = LiveState(connection = ConnectionState.IDLE, status = status)
         _track.value = emptyList()
+        _series.value = emptyList()
     }
 }

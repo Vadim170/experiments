@@ -42,7 +42,7 @@ data class ObdSnapshot(
  */
 class ElmSession(private val io: ElmIo) {
 
-    private companion object {
+    internal companion object {
         /**
          * Инициализация: эхо/переводы строк/пробелы/заголовки выключаем, протокол
          * выбираем автоматически. Ответы после этого — голый hex, что и разбирает
@@ -55,6 +55,12 @@ class ElmSession(private val io: ElmIo) {
             "ATH0" to "выключаю заголовки",
             "ATSP0" to "автовыбор протокола",
         )
+
+        /** Столько неудачных циклов подряд — и переопределяем источник расхода. */
+        const val REPROBE_AFTER_MISSES = 12
+
+        /** Подстановка, когда датчика температуры впуска нет. */
+        const val DEFAULT_INTAKE_TEMP_C = 25.0
     }
 
     var supportedPids: Set<Int> = emptySet()
@@ -62,6 +68,16 @@ class ElmSession(private val io: ElmIo) {
 
     var fuelSource: FuelSource = FuelSource.NONE
         private set
+
+    /** Что ответило при последней пробе — показываем на экране, чтобы не гадать. */
+    var diagnostics: String = ""
+        private set
+
+    /** Сколько циклов подряд источник расхода молчит. */
+    private var missStreak = 0
+
+    /** Есть ли датчик температуры впуска: без него speed-density берёт 25 °C. */
+    private var hasIntakeTemp = false
 
     /**
      * Полная инициализация адаптера и шины.
@@ -85,7 +101,7 @@ class ElmSession(private val io: ElmIo) {
         ObdParser.errorOf(probe)?.let { return it }
 
         supportedPids = detectSupportedPids(probe)
-        fuelSource = chooseFuelSource(supportedPids)
+        fuelSource = probeFuelSource()
         Logger.log("поддерживается PID: ${supportedPids.size}, расход: ${fuelSource.title}")
         return null
     }
@@ -111,6 +127,45 @@ class ElmSession(private val io: ElmIo) {
             if (data.size < 4 || data[3] and 0x01 == 0) return result
         }
         return result
+    }
+
+    /**
+     * Определяет источник расхода реальным запросом, а не битовой картой.
+     *
+     * Карта врёт в обе стороны: блоки отвечают на PID, которых в ней нет, и
+     * молчат на обещанные. Именно из-за доверия к карте расход мог не считаться
+     * вовсе, поэтому теперь спрашиваем напрямую и запоминаем, что ответило.
+     */
+    suspend fun probeFuelSource(): FuelSource {
+        val notes = mutableListOf<String>()
+
+        val engineRate = read(Pids.ENGINE_FUEL_RATE)?.let { Pids.fuelRateLitersPerHour(it) }
+        notes += if (engineRate != null) "5E ✓" else "5E —"
+        if (engineRate != null) {
+            diagnostics = notes.joinToString(" · ")
+            return FuelSource.ENGINE_FUEL_RATE
+        }
+
+        val maf = read(Pids.MAF)?.let { Pids.mafGramsPerSecond(it) }
+        notes += if (maf != null) "MAF ✓" else "MAF —"
+        if (maf != null) {
+            diagnostics = notes.joinToString(" · ")
+            return FuelSource.MAF
+        }
+
+        val rpm = read(Pids.RPM)?.let { Pids.rpm(it) }
+        val mapKpa = read(Pids.INTAKE_MAP)?.let { Pids.intakeMapKpa(it) }
+        hasIntakeTemp = read(Pids.INTAKE_TEMP)?.let { Pids.intakeTempC(it) } != null
+        notes += if (rpm != null) "RPM ✓" else "RPM —"
+        notes += if (mapKpa != null) "MAP ✓" else "MAP —"
+        notes += if (hasIntakeTemp) "IAT ✓" else "IAT —"
+        diagnostics = notes.joinToString(" · ")
+
+        // Температура впуска не обязательна: без неё подставим 25 °C
+        if (rpm != null && mapKpa != null) return FuelSource.SPEED_DENSITY
+
+        // Последний шанс — то, что обещает битовая карта
+        return chooseFuelSource(supportedPids)
     }
 
     fun chooseFuelSource(supported: Set<Int>): FuelSource = when {
@@ -148,8 +203,12 @@ class ElmSession(private val io: ElmIo) {
 
             FuelSource.SPEED_DENSITY -> {
                 val mapKpa = read(Pids.INTAKE_MAP)?.let { Pids.intakeMapKpa(it) }?.toDouble()
-                val intakeTemp = read(Pids.INTAKE_TEMP)?.let { Pids.intakeTempC(it) }?.toDouble()
-                if (rpm != null && mapKpa != null && intakeTemp != null) {
+                val intakeTemp = if (hasIntakeTemp) {
+                    read(Pids.INTAKE_TEMP)?.let { Pids.intakeTempC(it) }?.toDouble()
+                } else {
+                    null
+                } ?: DEFAULT_INTAKE_TEMP_C
+                if (rpm != null && mapKpa != null) {
                     FuelMath.fuelRateFromMaf(
                         FuelMath.estimateMafSpeedDensity(rpm, mapKpa, intakeTemp),
                     )
@@ -159,6 +218,22 @@ class ElmSession(private val io: ElmIo) {
             }
 
             FuelSource.NONE -> null
+        }
+
+        // Источник мог быть выбран на заглушенном моторе и замолчать на ходу
+        // (или наоборот). Молчит подряд — пробуем определить заново.
+        if (fuelRate == null) {
+            missStreak++
+            if (missStreak >= REPROBE_AFTER_MISSES) {
+                missStreak = 0
+                val previous = fuelSource
+                fuelSource = probeFuelSource()
+                if (fuelSource != previous) {
+                    Logger.log("источник расхода переопределён: ${fuelSource.title}")
+                }
+            }
+        } else {
+            missStreak = 0
         }
 
         var fuelLevel: Double? = null

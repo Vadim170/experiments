@@ -35,6 +35,10 @@ internal object Fmt {
 
     fun rpm(value: Double?): String = value?.let { "${it.roundToInt()}" } ?: "—"
 
+    /** Ускорение всегда со знаком: минус — торможение. */
+    fun acceleration(value: Double?): String =
+        value?.let { String.format(Locale.US, "%+.1f", it) } ?: "—"
+
     fun temp(value: Int?): String = value?.let { "$it °C" } ?: "—"
 
     fun duration(millis: Long): String {

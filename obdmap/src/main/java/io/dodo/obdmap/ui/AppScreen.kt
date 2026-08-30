@@ -20,6 +20,7 @@ import io.dodo.obdmap.obd.AdapterPicker
 private enum class Tab(val title: String) {
     LIVE("Поездка"),
     HISTORY("История"),
+    ANALYSIS("Анализ"),
     LOG("Лог"),
 }
 
@@ -79,6 +80,8 @@ fun AppScreen(
                 )
 
                 tab == Tab.HISTORY -> HistoryScreen(onOpenTrip = { openedTripId = it })
+
+                tab == Tab.ANALYSIS -> AnalysisScreen()
 
                 else -> LogScreen()
             }
