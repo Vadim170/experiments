@@ -502,6 +502,15 @@ private fun StatusRow(live: LiveState) {
                 },
             )
         }
+        if (live.protocol.isNotBlank()) {
+            Text(
+                text = "Протокол: ${live.protocol}",
+                style = MaterialTheme.typography.labelSmall,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
         if (live.diagnostics.isNotBlank()) {
             Text(
                 text = "PID расхода: ${live.diagnostics}",

@@ -81,8 +81,15 @@ class TripService : Service() {
         /** Нет данных с шины столько — поездка закончилась (зажигание выключили). */
         private const val IDLE_STOP_MS = 3 * 60 * 1000L
 
-        /** Пауза перед повторной попыткой связи в автоматическом режиме. */
+        /** Пауза перед первой повторной попыткой связи в автоматическом режиме. */
         private const val RECONNECT_DELAY_MS = 5_000L
+
+        /**
+         * Потолок паузы. Если шина молчит (зажигание выключено), повторять
+         * инициализацию каждые пять секунд бессмысленно: каждая попытка — это
+         * ATZ и перебор протоколов, то есть десятки секунд работы адаптера.
+         */
+        private const val MAX_RECONNECT_DELAY_MS = 5 * 60 * 1000L
 
         /**
          * Если связь вернулась в этот срок, продолжаем ту же поездку.
@@ -194,6 +201,7 @@ class TripService : Service() {
      */
     private suspend fun supervise(address: String, auto: Boolean) {
         var trip: ActiveTrip? = null
+        var retryDelay = RECONNECT_DELAY_MS
         try {
             while (currentCoroutineContext().isActive) {
                 val session = ElmSession(client)
@@ -208,9 +216,11 @@ class TripService : Service() {
                     if (!auto) return
                     // Поездку, которую уже не продолжить, закрываем
                     trip = finalizeIfStale(trip)
-                    delay(RECONNECT_DELAY_MS)
+                    delay(retryDelay)
+                    retryDelay = (retryDelay * 2).coerceAtMost(MAX_RECONNECT_DELAY_MS)
                     continue
                 }
+                retryDelay = RECONNECT_DELAY_MS
 
                 trip = driveLoop(session, trip, auto)
                 runCatching { client.close() }
@@ -268,6 +278,7 @@ class TripService : Service() {
                         connection = ConnectionState.WAITING,
                         status = "Адаптер на связи, жду запуска двигателя",
                         diagnostics = session.diagnostics,
+                        protocol = session.protocol,
                     )
                 }
                 updateNotification("Жду запуска двигателя")
@@ -342,6 +353,7 @@ class TripService : Service() {
                 accelerationMs2 = accelerationMs2 ?: state.accelerationMs2,
                 fuelSource = session.fuelSource,
                 diagnostics = session.diagnostics,
+                protocol = session.protocol,
                 stats = trip.accumulator.stats,
                 tripId = trip.id,
                 hasLocation = location != null,

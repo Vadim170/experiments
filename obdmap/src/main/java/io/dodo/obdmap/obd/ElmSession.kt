@@ -53,14 +53,47 @@ class ElmSession(private val io: ElmIo) {
             "ATL0" to "выключаю переводы строк",
             "ATS0" to "выключаю пробелы",
             "ATH0" to "выключаю заголовки",
-            "ATSP0" to "автовыбор протокола",
         )
+
+        /**
+         * Протоколы OBD-II в порядке перебора.
+         *
+         * Автовыбор пробуем первым, но полагаться только на него нельзя: часть
+         * клонов ELM327 при автопоиске отвечает UNABLE TO CONNECT на машине,
+         * с которой прекрасно работает при явно заданном протоколе. Для
+         * легковых 2008+ это почти всегда CAN 11 бит 500 кбод (номер 6),
+         * поэтому он идёт сразу за автовыбором.
+         */
+        val PROTOCOLS = listOf(
+            "0" to "автовыбор",
+            "6" to "ISO 15765-4 CAN 11 бит 500 кбод",
+            "7" to "ISO 15765-4 CAN 29 бит 500 кбод",
+            "8" to "ISO 15765-4 CAN 11 бит 250 кбод",
+            "9" to "ISO 15765-4 CAN 29 бит 250 кбод",
+            "5" to "ISO 14230-4 KWP (fast init)",
+            "3" to "ISO 9141-2",
+        )
+
+        /** Автопоиску даём две попытки: первая часто уходит на SEARCHING. */
+        const val AUTO_PROBE_ATTEMPTS = 2
+
+        /** Автопоиск думает дольше явного протокола. */
+        const val AUTO_PROBE_TIMEOUT_MS = 12_000L
+        const val PROBE_TIMEOUT_MS = 6_000L
 
         /** Столько неудачных циклов подряд — и переопределяем источник расхода. */
         const val REPROBE_AFTER_MISSES = 12
 
         /** Подстановка, когда датчика температуры впуска нет. */
         const val DEFAULT_INTAKE_TEMP_C = 25.0
+
+        /**
+         * Что говорить, когда ни один протокол не отозвался. Это уже не про
+         * приложение: адаптер на связи и выполняет команды, а машина молчит.
+         */
+        const val BUS_ERROR_HINT = "шина не отвечает ни на одном протоколе. " +
+            "Проверь: включено ли зажигание, до конца ли вставлен адаптер, " +
+            "не занят ли он другим приложением"
     }
 
     var supportedPids: Set<Int> = emptySet()
@@ -71,6 +104,10 @@ class ElmSession(private val io: ElmIo) {
 
     /** Что ответило при последней пробе — показываем на экране, чтобы не гадать. */
     var diagnostics: String = ""
+        private set
+
+    /** Протокол, на котором шина в итоге ответила. */
+    var protocol: String = ""
         private set
 
     /** Сколько циклов подряд источник расхода молчит. */
@@ -95,26 +132,63 @@ class ElmSession(private val io: ElmIo) {
      * @return null при успехе, иначе текст ошибки для интерфейса.
      */
     suspend fun initialize(): String? {
-        runCatching { io.send("ATZ", ElmIo.RESET_TIMEOUT_MS) }
-            .onFailure { return "адаптер не ответил на сброс: ${it.message}" }
+        val banner = runCatching { io.send("ATZ", ElmIo.RESET_TIMEOUT_MS) }
+            .getOrElse { return "адаптер не ответил на сброс: ${it.message}" }
+        // Версия прошивки в баннере — первое, что нужно знать про клон
+        Logger.log("ELM ATZ -> ${clean(banner)}")
 
         INIT_COMMANDS.forEach { (command, description) ->
             val response = runCatching { io.send(command) }
                 .getOrElse { return "$description: ${it.message}" }
             // На ATZ-эхо и мусор в буфере не ругаемся: важно, что адаптер отвечает.
-            Logger.log("ELM $command -> ${response.replace("\r", " ").trim()}")
+            Logger.log("ELM $command -> ${clean(response)}")
         }
 
-        // Первый запрос заодно поднимает шину: адаптер сам подберёт протокол.
-        val probe = runCatching { io.send(Pids.command(Pids.SUPPORTED_01_20), 10_000) }
-            .getOrElse { return "шина не поднялась: ${it.message}" }
-        ObdParser.errorOf(probe)?.let { return it }
+        val probe = openBus() ?: return BUS_ERROR_HINT
 
         supportedPids = detectSupportedPids(probe)
         fuelSource = probeFuelSource()
         Logger.log("поддерживается PID: ${supportedPids.size}, расход: ${fuelSource.title}")
         return null
     }
+
+    /**
+     * Поднимает шину, перебирая протоколы. Успехом считаем не «нет ошибки», а
+     * разобранный ответ на 0100: клоны умеют отвечать мусором без слова ERROR.
+     *
+     * @return сырой ответ на 0100 либо null, если ни один протокол не ответил
+     */
+    private suspend fun openBus(): String? {
+        val command = Pids.command(Pids.SUPPORTED_01_20)
+
+        PROTOCOLS.forEach { (code, title) ->
+            val set = runCatching { io.send("ATSP$code") }.getOrNull()
+            if (set == null) {
+                Logger.error("не удалось задать протокол $title")
+                return@forEach
+            }
+
+            val attempts = if (code == "0") AUTO_PROBE_ATTEMPTS else 1
+            val timeout = if (code == "0") AUTO_PROBE_TIMEOUT_MS else PROBE_TIMEOUT_MS
+
+            repeat(attempts) {
+                val response = runCatching { io.send(command, timeout) }.getOrNull()
+                if (response != null &&
+                    ObdParser.dataBytes(0x01, Pids.SUPPORTED_01_20, response, command) != null
+                ) {
+                    protocol = title
+                    Logger.log("шина поднялась, протокол: $title")
+                    return response
+                }
+                val reason = response?.let { ObdParser.errorOf(it) ?: clean(it) } ?: "нет ответа"
+                Logger.log("протокол $title не подошёл: $reason")
+            }
+        }
+        return null
+    }
+
+    private fun clean(response: String) =
+        response.replace("\r", " ").replace("\n", " ").replace(">", "").trim()
 
     /**
      * Обходит битовые карты 0x00/0x20/0x40 и собирает список поддерживаемых PID.

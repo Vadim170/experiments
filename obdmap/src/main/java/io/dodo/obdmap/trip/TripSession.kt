@@ -51,6 +51,8 @@ data class LiveState(
     val accelerationMs2: Double? = null,
     /** Что ответило при пробе PID расхода — видно на экране, чтобы не гадать. */
     val diagnostics: String = "",
+    /** Протокол, на котором отозвалась шина. */
+    val protocol: String = "",
     val stats: TripStats = TripStats(),
     val tripId: Long? = null,
     val hasLocation: Boolean = false,

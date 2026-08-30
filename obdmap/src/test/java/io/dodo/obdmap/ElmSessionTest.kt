@@ -77,8 +77,9 @@ class ElmSessionTest {
         val session = ElmSession(io)
 
         val error = session.initialize()
-        assertEquals("адаптер не видит шину авто", error)
+        assertNotNull(error)
         assertEquals(FuelSource.NONE, session.fuelSource)
+        assertEquals("", session.protocol)
     }
 
     @Test
@@ -165,6 +166,60 @@ class ElmSessionTest {
         io.cycles = 1
         repeat(ElmSession.REPROBE_AFTER_MISSES + 1) { session.readSnapshot(nowMs = 1_000) }
         assertEquals(FuelSource.ENGINE_FUEL_RATE, session.fuelSource)
+    }
+
+    @Test
+    fun `при отказе автовыбора протокол подбирается явно`() = runTest {
+        // Ровно то, что было в логе на машине: адаптер отвечает OK на все
+        // настройки, а 0100 при автопоиске возвращает UNABLE TO CONNECT
+        val io = object : ElmIo {
+            val sent = mutableListOf<String>()
+            var protocolSet = "0"
+
+            override suspend fun send(command: String, timeoutMs: Long): String {
+                sent += command
+                if (command.startsWith("ATSP")) {
+                    protocolSet = command.removePrefix("ATSP")
+                    return "OK\r\r>"
+                }
+                // Шина отвечает только на явно заданном протоколе 6
+                if (protocolSet == "0") return "SEARCHING...\rUNABLE TO CONNECT\r\r>"
+                if (protocolSet != "6") return "NO DATA\r\r>"
+                return rapidLike[command] ?: "NO DATA\r\r>"
+            }
+        }
+        val session = ElmSession(io)
+
+        assertNull(session.initialize())
+        assertEquals("ISO 15765-4 CAN 11 бит 500 кбод", session.protocol)
+        assertTrue("автовыбор должен пробоваться первым", io.sent.indexOf("ATSP0") < io.sent.indexOf("ATSP6"))
+        assertTrue(Pids.MAF in session.supportedPids)
+    }
+
+    @Test
+    fun `когда молчат все протоколы ошибка объясняет что проверить`() = runTest {
+        val io = object : ElmIo {
+            val tried = mutableListOf<String>()
+            override suspend fun send(command: String, timeoutMs: Long): String {
+                if (command.startsWith("ATSP")) tried += command
+                if (command == "0100") return "UNABLE TO CONNECT\r\r>"
+                return "OK\r\r>"
+            }
+        }
+        val session = ElmSession(io)
+
+        val error = session.initialize()
+        assertNotNull(error)
+        assertTrue("ошибка должна подсказывать про зажигание: $error", error!!.contains("зажигание"))
+        assertEquals(ElmSession.PROTOCOLS.size, io.tried.size)
+    }
+
+    @Test
+    fun `мусор вместо данных не считается поднятой шиной`() = runTest {
+        // Клоны умеют отвечать чем угодно без слова ERROR
+        val io = FakeElm(rapidLike + ("0100" to "?\r\r>"))
+        val session = ElmSession(io)
+        assertNotNull(session.initialize())
     }
 
     @Test
