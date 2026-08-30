@@ -159,6 +159,7 @@ fun LiveScreen(
                         speedThresholds = speedThresholds,
                         modifier = Modifier.weight(1f).fillMaxWidth(),
                         followLast = true,
+                        showVehicle = true,
                     )
                     PaletteLegend(
                         mode = colorMode,

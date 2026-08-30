@@ -191,6 +191,24 @@ class TrimmedHistogramTest {
     }
 
     @Test
+    fun `заданный шаг применяется`() {
+        val values = List(200) { 5.0 + it % 20 * 0.1 }
+        val coarse = ConsumptionStats.trimmedHistogram(values, binWidth = 1.0)
+        val fine = ConsumptionStats.trimmedHistogram(values, binWidth = 0.2)
+        assertTrue("мелкий шаг должен дать больше корзин", fine.size > coarse.size)
+        coarse.forEach { assertEquals(1.0, it.to - it.from, 0.0001) }
+        fine.forEach { assertEquals(0.2, it.to - it.from, 0.0001) }
+    }
+
+    @Test
+    fun `слишком мелкий шаг на широком разбросе ограничивается`() {
+        val values = List(500) { it * 0.1 }
+        val bins = ConsumptionStats.trimmedHistogram(values, binWidth = 0.01)
+        assertTrue("корзин не должно быть больше потолка: ${bins.size}",
+            bins.size <= ConsumptionStats.MAX_BINS + 2)
+    }
+
+    @Test
     fun `одинаковые значения не ломают обрезку`() {
         val bins = ConsumptionStats.trimmedHistogram(List(50) { 7.0 })
         assertTrue(bins.isNotEmpty())

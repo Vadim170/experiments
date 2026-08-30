@@ -7,7 +7,10 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.core.content.ContextCompat
+import io.dodo.obdmap.R
 import io.dodo.obdmap.analysis.TrackPalette
+import io.dodo.obdmap.util.Geo
 import org.osmdroid.tileprovider.tilesource.TileSourceFactory
 import org.osmdroid.util.BoundingBox
 import org.osmdroid.util.GeoPoint
@@ -42,6 +45,7 @@ data class MapPoint(
  *
  * @param followLast держать камеру на последней точке — режим живой поездки
  * @param fitAll вписать весь трек в экран — режим просмотра истории
+ * @param showVehicle рисовать машинку в текущей точке, развёрнутую по курсу
  */
 @Composable
 fun TrackMap(
@@ -51,8 +55,10 @@ fun TrackMap(
     speedThresholds: List<Double> = TrackPalette.DEFAULT_SPEED_THRESHOLDS,
     followLast: Boolean = false,
     fitAll: Boolean = false,
+    showVehicle: Boolean = false,
 ) {
     val context = LocalContext.current
+    val carIcon = remember { ContextCompat.getDrawable(context, R.drawable.ic_car_top) }
 
     val mapView = remember {
         MapView(context).apply {
@@ -102,6 +108,22 @@ fun TrackMap(
                     )
                 }
 
+                if (showVehicle && carIcon != null) {
+                    view.overlays.add(
+                        Marker(view).apply {
+                            position = geoPoints.last()
+                            icon = carIcon
+                            title = "Машина"
+                            setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
+                            // «Плоский» маркер живёт в системе координат карты;
+                            // osmdroid поворачивает холст на -rotation, а иконка
+                            // нарисована носом на север, поэтому знак обратный.
+                            setFlat(true)
+                            rotation = -(bearingOf(drawn)?.toFloat() ?: 0f)
+                        },
+                    )
+                }
+
                 when {
                     fitAll && geoPoints.size > 1 -> {
                         // zoomToBoundingBox до первой отрисовки молча ничего не делает,
@@ -120,6 +142,39 @@ fun TrackMap(
 
 /** Сколько точек максимум рисуем: дальше глазу всё равно, а карте тяжело. */
 private const val MAX_DRAWN_POINTS = 2_000
+
+/**
+ * По какому отрезку пути считаем курс. По двум последним точкам нельзя:
+ * на стоянке шум GPS крутил бы машинку вокруг своей оси.
+ */
+private const val BEARING_DISTANCE_M = 12.0
+
+/**
+ * Курс в последней точке: ищем назад ближайшую точку, отстоящую хотя бы на
+ * [BEARING_DISTANCE_M]. Если такой нет — стоим, и разворачивать нечего.
+ */
+private fun bearingOf(points: List<MapPoint>): Double? {
+    if (points.size < 2) return null
+    val last = points.last()
+    for (index in points.size - 2 downTo 0) {
+        val candidate = points[index]
+        val distance = Geo.distanceMeters(
+            candidate.latitude,
+            candidate.longitude,
+            last.latitude,
+            last.longitude,
+        )
+        if (distance >= BEARING_DISTANCE_M) {
+            return Geo.bearingDegrees(
+                candidate.latitude,
+                candidate.longitude,
+                last.latitude,
+                last.longitude,
+            )
+        }
+    }
+    return null
+}
 
 /** Отрезок трека одного цвета: индексы точек в прореженном списке. */
 private data class Segment(val indices: List<Int>, val color: Int)

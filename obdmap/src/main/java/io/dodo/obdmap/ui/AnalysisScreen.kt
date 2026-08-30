@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Card
@@ -60,6 +61,10 @@ fun AnalysisScreen() {
     }
     var filterByAcceleration by remember { mutableStateOf(true) }
 
+    // null — шаг подбирается автоматически по разбросу
+    var histogramStep by remember { mutableStateOf<Double?>(null) }
+    var speedStep by remember { mutableStateOf(SPEED_BIN_KMH) }
+
     val samples = all
     if (samples == null) {
         Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text("Читаю историю…") }
@@ -87,7 +92,7 @@ fun AnalysisScreen() {
     }
     // Кривая «расход от стабильной скорости» строится по всему диапазону:
     // ограничение по скорости здесь только мешало бы видеть картину целиком.
-    val bySpeed = remember(samples, maxAcceleration, filterByAcceleration) {
+    val bySpeed = remember(samples, maxAcceleration, filterByAcceleration, speedStep) {
         ConsumptionStats.bySpeedBin(
             samples = ConsumptionStats.filter(
                 samples = samples,
@@ -95,14 +100,17 @@ fun AnalysisScreen() {
                 maxSpeedKmh = 300.0,
                 maxAbsAcceleration = if (filterByAcceleration) maxAcceleration.toDouble() else null,
             ),
-            binKmh = SPEED_BIN_KMH,
+            binKmh = speedStep,
         )
     }
     // Обрезаем края: без фильтра по ускорению в выборку попадают разгоны с
     // расходом в десятки л/100 км, и гистограмма по сырому min..max
     // превращалась в пустой прямоугольник из сотен корзин.
-    val histogram = remember(filtered) {
-        ConsumptionStats.trimmedHistogram(filtered.map { it.litersPer100Km })
+    val histogram = remember(filtered, histogramStep) {
+        ConsumptionStats.trimmedHistogram(
+            values = filtered.map { it.litersPer100Km },
+            binWidth = histogramStep,
+        )
     }
 
     Column(
@@ -160,6 +168,13 @@ fun AnalysisScreen() {
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+                StepChips(
+                    title = "Шаг, л/100 км",
+                    options = HISTOGRAM_STEPS,
+                    selected = histogramStep,
+                    onSelect = { histogramStep = it },
+                    format = { Fmt.number(it, decimals = if (it < 1) 1 else 0) },
+                )
                 Spacer(Modifier.height(8.dp))
                 if (filtered.size < ConsumptionStats.MIN_BIN_COUNT) {
                     Text(
@@ -195,10 +210,16 @@ fun AnalysisScreen() {
                     style = MaterialTheme.typography.titleSmall,
                 )
                 Text(
-                    "медиана линией, коридор p25–p75 заливкой; шаг " +
-                        "${SPEED_BIN_KMH.roundToInt()} км/ч",
+                    "медиана линией, коридор p25–p75 заливкой",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                StepChips(
+                    title = "Шаг, км/ч",
+                    options = SPEED_STEPS,
+                    selected = speedStep,
+                    onSelect = { speedStep = it ?: SPEED_BIN_KMH },
+                    format = { Fmt.number(it, decimals = 0) },
                 )
                 Spacer(Modifier.height(8.dp))
                 if (bySpeed.size < 2) {
@@ -236,6 +257,42 @@ fun AnalysisScreen() {
 }
 
 private const val SPEED_BIN_KMH = 10.0
+
+/** Шаги гистограммы расхода; null — автоматический подбор. */
+private val HISTOGRAM_STEPS = listOf(null, 0.2, 0.5, 1.0, 2.0)
+
+/** Шаги корзин по скорости. Без «авто»: тут шаг — это осмысленный выбор. */
+private val SPEED_STEPS = listOf(5.0, 10.0, 20.0)
+
+/**
+ * Ряд чипов для выбора шага. [selected] == null означает автоматический
+ * подбор, если он есть среди [options].
+ */
+@Composable
+private fun StepChips(
+    title: String,
+    options: List<Double?>,
+    selected: Double?,
+    onSelect: (Double?) -> Unit,
+    format: (Double) -> String,
+) {
+    Column(Modifier.padding(top = 4.dp)) {
+        Text(title, style = MaterialTheme.typography.labelSmall)
+        Row(
+            modifier = Modifier.horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            options.forEach { option ->
+                FilterChip(
+                    selected = selected == option,
+                    onClick = { onSelect(option) },
+                    label = { Text(option?.let(format) ?: "авто") },
+                )
+            }
+        }
+    }
+}
 
 @Composable
 private fun Stat(title: String, value: Double?) {

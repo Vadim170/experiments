@@ -79,25 +79,35 @@ object ConsumptionStats {
      * корзин превращается в пустой прямоугольник. Поэтому края обрезаются по
      * перцентилям, а число корзин фиксировано.
      *
-     * @param targetBins сколько корзин хотим получить
+     * @param targetBins сколько корзин хотим получить, если шаг не задан
      * @param trim какую долю отбрасывать с каждого края
+     * @param binWidth явный шаг; null — подобрать автоматически
      */
     fun trimmedHistogram(
         values: List<Double>,
         targetBins: Int = DEFAULT_BINS,
         trim: Double = DEFAULT_TRIM,
+        binWidth: Double? = null,
     ): List<HistogramBin> {
-        if (values.size < 2 || targetBins < 1) return histogram(values, 1.0)
+        val fallbackWidth = binWidth ?: 1.0
+        if (values.size < 2 || targetBins < 1) return histogram(values, fallbackWidth)
         val low = percentile(values, trim) ?: return emptyList()
         val high = percentile(values, 1 - trim) ?: return emptyList()
-        if (high <= low) return histogram(values, 1.0)
+        if (high <= low) return histogram(values, fallbackWidth)
 
         val inRange = values.filter { it in low..high }
         if (inRange.isEmpty()) return emptyList()
 
-        val width = niceStep((high - low) / targetBins)
-        return histogram(inRange, width)
+        val width = binWidth?.takeIf { it > 0 } ?: niceStep((high - low) / targetBins)
+        // Слишком мелкий шаг на широком разбросе даёт нечитаемую гребёнку —
+        // ограничиваем число корзин, даже если шаг задан вручную.
+        val binCount = ((high - low) / width).toInt()
+        val safeWidth = if (binCount > MAX_BINS) niceStep((high - low) / MAX_BINS) else width
+        return histogram(inRange, safeWidth)
     }
+
+    /** Потолок числа корзин: дальше столбики становятся тоньше пикселя. */
+    const val MAX_BINS = 80
 
     /** Доля значений, отбрасываемая с каждого края перед построением гистограммы. */
     const val DEFAULT_TRIM = 0.02
