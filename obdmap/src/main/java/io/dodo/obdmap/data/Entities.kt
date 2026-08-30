@@ -20,6 +20,51 @@ data class TripEntity(
     val fuelSource: String = "",
 )
 
+/**
+ * Архив трека: точки старой поездки, упакованные в один сжатый блоб.
+ *
+ * Когда история упирается в лимит размера, точки самых старых поездок
+ * переезжают сюда, а строки из `points` удаляются. Сама поездка остаётся в
+ * списке со всеми итогами — пользователь разницы не видит, кроме того, что
+ * трек разворачивается чуть медленнее.
+ */
+@Entity(
+    tableName = "archives",
+    foreignKeys = [
+        ForeignKey(
+            entity = TripEntity::class,
+            parentColumns = ["id"],
+            childColumns = ["tripId"],
+            onDelete = ForeignKey.CASCADE,
+        ),
+    ],
+)
+data class ArchiveEntity(
+    @PrimaryKey val tripId: Long,
+    val pointCount: Int,
+    val originalCount: Int,
+    val data: ByteArray,
+) {
+    // ByteArray в data-классе требует ручного сравнения: массивы сравниваются
+    // по ссылке, и автоматический equals сломал бы кеши Room.
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other !is ArchiveEntity) return false
+        return tripId == other.tripId &&
+            pointCount == other.pointCount &&
+            originalCount == other.originalCount &&
+            data.contentEquals(other.data)
+    }
+
+    override fun hashCode(): Int {
+        var result = tripId.hashCode()
+        result = 31 * result + pointCount
+        result = 31 * result + originalCount
+        result = 31 * result + data.contentHashCode()
+        return result
+    }
+}
+
 /** Точка трека. Координаты могут отсутствовать: в туннеле GPS молчит, а данные с шины идут. */
 @Entity(
     tableName = "points",

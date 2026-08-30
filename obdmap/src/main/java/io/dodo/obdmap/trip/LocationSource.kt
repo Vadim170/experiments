@@ -26,12 +26,25 @@ class LocationSource(private val context: Context) {
 
         /** Фикс старше этого в трек не пишем. */
         const val MAX_AGE_MS = 10_000L
+
+        /** Потолок очереди неразобранных фиксов. */
+        const val MAX_PENDING = 300
     }
 
     private val manager = context.getSystemService(Context.LOCATION_SERVICE) as? LocationManager
 
     @Volatile
     private var latest: Location? = null
+
+    /**
+     * Фиксы, ещё не забранные в трек.
+     *
+     * Раньше точка писалась в такт опроса шины, а он медленнее GPS и вдобавок
+     * плавает: при заминке BLE между двумя точками проходили десятки секунд, и
+     * маршрут превращался в прямую. Теперь копим каждый фикс, а цикл забирает
+     * их все разом.
+     */
+    private val pending = ArrayDeque<Location>()
 
     private var started = false
 
@@ -41,6 +54,11 @@ class LocationSource(private val context: Context) {
             // Сетевой фикс может прийти позже точного GPS — не откатываемся назад
             if (previous != null && location.time in 1 until previous.time) return
             latest = location
+            synchronized(pending) {
+                pending.addLast(location)
+                // Очередь не должна расти бесконечно, если трек никто не забирает
+                while (pending.size > MAX_PENDING) pending.removeFirst()
+            }
         }
 
         @Suppress("OVERRIDE_DEPRECATION")
@@ -86,6 +104,18 @@ class LocationSource(private val context: Context) {
         started = false
         runCatching { manager?.removeUpdates(listener) }
         latest = null
+        synchronized(pending) { pending.clear() }
+    }
+
+    /** Забирает накопленные фиксы и очищает очередь. */
+    fun drainFixes(): List<Location> = synchronized(pending) {
+        if (pending.isEmpty()) {
+            emptyList()
+        } else {
+            val result = pending.toList()
+            pending.clear()
+            result
+        }
     }
 
     /** Достаточно свежая позиция или null. */

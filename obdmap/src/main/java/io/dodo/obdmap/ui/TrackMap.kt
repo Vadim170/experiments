@@ -39,9 +39,9 @@ data class MapPoint(
  * osmdroid — обычный View, поэтому оборачиваем в AndroidView. Ключей API не
  * требует, тайлы тянет сам и кеширует на диск (настройка кеша — в ObdApp).
  *
- * Трек красится по полосам: подряд идущие точки одного цвета собираются в одну
- * ломаную. Рисовать по отрезку на точку нельзя — на длинной поездке это десятки
- * тысяч оверлеев, карта встанет.
+ * Трек красится градиентом, квантованным на ступени: подряд идущие точки одного
+ * цвета собираются в одну ломаную. Рисовать по отрезку на точку нельзя — на
+ * длинной поездке это десятки тысяч оверлеев, карта встанет.
  *
  * @param followLast держать камеру на последней точке — режим живой поездки
  * @param fitAll вписать весь трек в экран — режим просмотра истории
@@ -190,11 +190,12 @@ private fun segments(
 ): List<Segment> {
     if (points.size < 2) return emptyList()
     val result = mutableListOf<Segment>()
-    var currentColor = TrackPalette.colorOf(mode, points[0].value(mode), speedThresholds)
+    var currentColor =
+        TrackPalette.quantizedGradientColor(mode, points[0].value(mode), speedThresholds)
     var currentIndices = mutableListOf(0)
 
     for (index in 1 until points.size) {
-        val color = TrackPalette.colorOf(mode, points[index].value(mode), speedThresholds)
+        val color = TrackPalette.quantizedGradientColor(mode, points[index].value(mode), speedThresholds)
         currentIndices.add(index)
         if (color != currentColor) {
             result += Segment(currentIndices, currentColor)

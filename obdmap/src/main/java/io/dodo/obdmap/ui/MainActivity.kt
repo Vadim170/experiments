@@ -85,6 +85,17 @@ class MainActivity : ComponentActivity() {
         super.onResume()
         refreshPermissions()
         refreshAdapter()
+        resumeAutoMode()
+    }
+
+    /**
+     * В автоматическом режиме сервис должен работать всегда, а не только после
+     * нажатия кнопки. Повторный старт безопасен: сервис видит, что уже занят.
+     */
+    private fun resumeAutoMode() {
+        if (!autoMode || !permissionsGranted) return
+        val address = adapterAddress ?: return
+        TripService.start(this, address, auto = true)
     }
 
     private fun refreshAdapter() {

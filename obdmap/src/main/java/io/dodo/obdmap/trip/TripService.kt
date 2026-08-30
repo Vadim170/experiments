@@ -19,6 +19,7 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import io.dodo.obdmap.R
+import io.dodo.obdmap.data.HistoryStore
 import io.dodo.obdmap.data.PointEntity
 import io.dodo.obdmap.data.TripDatabase
 import io.dodo.obdmap.data.TripEntity
@@ -119,6 +120,17 @@ class TripService : Service() {
         val acceleration = AccelerationTracker()
         val pending = mutableListOf<PointEntity>()
         var lastDataAt: Long = System.currentTimeMillis()
+
+        /**
+         * Последние известные показания. Отдельный PID может не ответить в
+         * конкретном цикле, и раньше точка уезжала в базу с null — из-за этого
+         * трек красился сплошным серым, хотя скорость менялась.
+         */
+        var speedKmh: Double? = null
+        var rpm: Double? = null
+        var fuelRateLitersPerHour: Double? = null
+        var litersPer100Km: Double? = null
+        var accelerationMs2: Double? = null
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -181,6 +193,8 @@ class TripService : Service() {
         if (worker?.isActive == true) return START_STICKY
         acquireWakeLock()
         locationSource.start()
+        // История не должна расти бесконечно: старое уезжает в архив
+        scope.launch { runCatching { HistoryStore.enforceLimit(applicationContext) } }
         worker = scope.launch { supervise(address, auto) }
         return START_STICKY
     }
@@ -323,53 +337,37 @@ class TripService : Service() {
         snapshot: ObdSnapshot,
         now: Long,
     ) {
-        val location = locationSource.current()
-        val accelerationMs2 = trip.acceleration.add(now, snapshot.speedKmh)
-
-        trip.accumulator.add(
-            TripSample(
-                timeMs = now,
-                latitude = location?.latitude,
-                longitude = location?.longitude,
-                speedKmh = snapshot.speedKmh,
-                fuelRateLitersPerHour = snapshot.fuelRateLitersPerHour,
-            ),
-        )
-
-        val instant = snapshot.fuelRateLitersPerHour?.let { rate ->
-            FuelMath.litersPer100Km(rate, snapshot.speedKmh ?: 0.0)
+        // Показания запоминаем: молчание одного PID в конкретном цикле не должно
+        // стирать уже известное значение.
+        snapshot.speedKmh?.let { trip.speedKmh = it }
+        snapshot.rpm?.let { trip.rpm = it }
+        snapshot.fuelRateLitersPerHour?.let { trip.fuelRateLitersPerHour = it }
+        trip.acceleration.add(now, snapshot.speedKmh)?.let { trip.accelerationMs2 = it }
+        trip.litersPer100Km = trip.fuelRateLitersPerHour?.let { rate ->
+            FuelMath.litersPer100Km(rate, trip.speedKmh ?: 0.0)
         }
+
+        // Забираем все накопленные фиксы: при заминке BLE их набирается
+        // несколько, и записать надо каждый, иначе маршрут станет прямой.
+        val fixes = locationSource.drainFixes()
 
         TripSession.update { state ->
             state.copy(
                 connection = ConnectionState.LIVE,
                 status = "Идёт запись",
-                speedKmh = snapshot.speedKmh ?: state.speedKmh,
-                rpm = snapshot.rpm ?: state.rpm,
-                fuelRateLitersPerHour = snapshot.fuelRateLitersPerHour,
-                litersPer100Km = instant,
+                speedKmh = trip.speedKmh,
+                rpm = trip.rpm,
+                fuelRateLitersPerHour = trip.fuelRateLitersPerHour,
+                litersPer100Km = trip.litersPer100Km,
                 fuelLevelPercent = snapshot.fuelLevelPercent ?: state.fuelLevelPercent,
                 coolantTempC = snapshot.coolantTempC ?: state.coolantTempC,
-                accelerationMs2 = accelerationMs2 ?: state.accelerationMs2,
+                accelerationMs2 = trip.accelerationMs2,
                 fuelSource = session.fuelSource,
                 diagnostics = session.diagnostics,
                 protocol = session.protocol,
                 stats = trip.accumulator.stats,
                 tripId = trip.id,
-                hasLocation = location != null,
-            )
-        }
-
-        if (location != null) {
-            TripSession.addTrackPoint(
-                TrackPoint(
-                    timeMs = now,
-                    latitude = location.latitude,
-                    longitude = location.longitude,
-                    speedKmh = snapshot.speedKmh,
-                    litersPer100Km = instant,
-                    accelerationMs2 = accelerationMs2,
-                ),
+                hasLocation = fixes.isNotEmpty() || locationSource.current() != null,
             )
         }
 
@@ -377,27 +375,68 @@ class TripService : Service() {
         TripSession.addSample(
             LiveSample(
                 timeMs = now,
-                speedKmh = snapshot.speedKmh,
-                litersPer100Km = instant,
-                accelerationMs2 = accelerationMs2,
+                speedKmh = trip.speedKmh,
+                litersPer100Km = trip.litersPer100Km,
+                accelerationMs2 = trip.accelerationMs2,
             ),
         )
 
-        trip.pending += PointEntity(
-            tripId = trip.id,
-            timeMs = now,
-            latitude = location?.latitude,
-            longitude = location?.longitude,
-            speedKmh = snapshot.speedKmh,
-            rpm = snapshot.rpm,
-            fuelRateLitersPerHour = snapshot.fuelRateLitersPerHour,
-            litersPer100Km = instant,
-            accelerationMs2 = accelerationMs2,
-        )
+        if (fixes.isEmpty()) {
+            // Координат не подвезли — точка только с данными шины
+            emitPoint(trip, now, latitude = null, longitude = null)
+        } else {
+            fixes.forEach { fix ->
+                emitPoint(trip, fix.time.takeIf { it > 0 } ?: now, fix.latitude, fix.longitude)
+            }
+        }
+
         if (trip.pending.size >= POINT_BATCH) {
             dao.insertPoints(trip.pending.toList())
             trip.pending.clear()
         }
+    }
+
+    /** Одна точка трека: в статистику, в живую карту и в очередь на запись. */
+    private fun emitPoint(
+        trip: ActiveTrip,
+        timeMs: Long,
+        latitude: Double?,
+        longitude: Double?,
+    ) {
+        trip.accumulator.add(
+            TripSample(
+                timeMs = timeMs,
+                latitude = latitude,
+                longitude = longitude,
+                speedKmh = trip.speedKmh,
+                fuelRateLitersPerHour = trip.fuelRateLitersPerHour,
+            ),
+        )
+
+        if (latitude != null && longitude != null) {
+            TripSession.addTrackPoint(
+                TrackPoint(
+                    timeMs = timeMs,
+                    latitude = latitude,
+                    longitude = longitude,
+                    speedKmh = trip.speedKmh,
+                    litersPer100Km = trip.litersPer100Km,
+                    accelerationMs2 = trip.accelerationMs2,
+                ),
+            )
+        }
+
+        trip.pending += PointEntity(
+            tripId = trip.id,
+            timeMs = timeMs,
+            latitude = latitude,
+            longitude = longitude,
+            speedKmh = trip.speedKmh,
+            rpm = trip.rpm,
+            fuelRateLitersPerHour = trip.fuelRateLitersPerHour,
+            litersPer100Km = trip.litersPer100Km,
+            accelerationMs2 = trip.accelerationMs2,
+        )
     }
 
     private suspend fun connectAndInit(
@@ -476,6 +515,7 @@ class TripService : Service() {
             ),
         )
         runCatching { dao.deleteEmptyTrips() }
+        runCatching { HistoryStore.enforceLimit(applicationContext) }
     }
 
     private fun stopEverything(status: String?) {

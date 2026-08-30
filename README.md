@@ -20,7 +20,7 @@
 echo "sdk.dir=/путь/к/android-sdk" > local.properties
 
 ./gradlew assembleDebug        # оба APK
-./gradlew testDebugUnitTest    # 130 юнит-тестов
+./gradlew testDebugUnitTest    # 154 юнит-теста
 ./gradlew lintDebug            # MissingPermission поднят до уровня ошибки
 ```
 

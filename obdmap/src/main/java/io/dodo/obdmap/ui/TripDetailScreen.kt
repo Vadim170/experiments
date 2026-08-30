@@ -1,5 +1,6 @@
 package io.dodo.obdmap.ui
 
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -11,12 +12,8 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.Card
-import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -26,25 +23,34 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import io.dodo.obdmap.analysis.TrackPalette
+import io.dodo.obdmap.data.HistoryStore
 import io.dodo.obdmap.data.PointEntity
 import io.dodo.obdmap.data.TripDatabase
 import io.dodo.obdmap.data.TripEntity
-import io.dodo.obdmap.analysis.TrackPalette
 import io.dodo.obdmap.obd.FuelMath
 import io.dodo.obdmap.util.Prefs
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 @Composable
 fun TripDetailScreen(tripId: Long, onBack: () -> Unit) {
     val context = LocalContext.current
     val dao = remember { TripDatabase.get(context).tripDao() }
 
-    var loaded by remember(tripId) {
-        mutableStateOf<Pair<TripEntity?, List<PointEntity>>?>(null)
+    var trip by remember(tripId) { mutableStateOf<TripEntity?>(null) }
+    var points by remember(tripId) { mutableStateOf<List<PointEntity>?>(null) }
+    var archived by remember(tripId) { mutableStateOf(false) }
+
+    LaunchedEffect(tripId) {
+        withContext(Dispatchers.IO) {
+            trip = dao.trip(tripId)
+            archived = dao.archive(tripId) != null
+            points = HistoryStore.points(context, tripId)
+        }
     }
-    LaunchedEffect(tripId) { loaded = dao.trip(tripId) to dao.points(tripId) }
 
     var colorMode by rememberSaveable {
         mutableStateOf(
@@ -55,29 +61,39 @@ fun TripDetailScreen(tripId: Long, onBack: () -> Unit) {
     }
     val speedThresholds = remember { Prefs.speedThresholds(context) }
 
-    val data = loaded
-    if (data == null) {
-        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text("Загружаю…") }
-        return
-    }
-    val trip = data.first
-    val points = data.second
-    if (trip == null) {
-        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text("Поездка не найдена") }
+    val loaded = trip
+    val track = points
+    if (loaded == null || track == null) {
+        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            EmptyState("Загружаю…")
+        }
         return
     }
 
-    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
-        Row(
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            TextButton(onClick = onBack) { Text("← Назад") }
-            Text(Fmt.dateTime(trip.startedAt), style = MaterialTheme.typography.titleMedium)
+    Column(
+        Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(12.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            GhostButton("← Назад", onClick = onBack)
+            Spacer(Modifier.padding(horizontal = 6.dp))
+            Column {
+                Text(Fmt.dateTime(loaded.startedAt), style = MaterialTheme.typography.titleMedium)
+                if (archived) {
+                    Text(
+                        text = "из архива · трек прорежен",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = Palette.TextMuted,
+                    )
+                }
+            }
         }
 
-        val mapPoints = remember(points) {
-            points.mapNotNull { point ->
+        val mapPoints = remember(track) {
+            track.mapNotNull { point ->
                 val latitude = point.latitude
                 val longitude = point.longitude
                 if (latitude != null && longitude != null) {
@@ -95,129 +111,113 @@ fun TripDetailScreen(tripId: Long, onBack: () -> Unit) {
         }
 
         if (mapPoints.isEmpty()) {
-            Card(Modifier.fillMaxWidth().padding(12.dp)) {
-                Text(
-                    "У поездки нет координат — GPS не ловился, есть только данные с шины.",
-                    modifier = Modifier.padding(12.dp),
-                    style = MaterialTheme.typography.bodyMedium,
-                )
-            }
+            Panel { EmptyState("У поездки нет координат — есть только данные с шины.") }
         } else {
             Row(
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp),
+                modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
             ) {
                 TrackPalette.Mode.entries.forEach { mode ->
-                    FilterChip(
-                        selected = colorMode == mode,
-                        onClick = {
-                            colorMode = mode
-                            Prefs.setColorMode(context, mode.name)
-                        },
-                        label = { Text(mode.title) },
-                    )
+                    Pill(mode.title, colorMode == mode) {
+                        colorMode = mode
+                        Prefs.setColorMode(context, mode.name)
+                    }
                 }
             }
             TrackMap(
                 points = mapPoints,
                 mode = colorMode,
                 speedThresholds = speedThresholds,
-                modifier = Modifier.fillMaxWidth().height(320.dp).padding(12.dp),
+                modifier = Modifier.fillMaxWidth().height(300.dp),
                 fitAll = true,
             )
-            PaletteLegend(
-                mode = colorMode,
-                speedThresholds = speedThresholds,
-                modifier = Modifier.padding(horizontal = 12.dp),
-            )
-            MapCacheCard(Modifier.padding(12.dp))
+            GradientLegend(mode = colorMode, speedThresholds = speedThresholds)
         }
 
-        Stats(trip)
+        Stats(loaded)
 
-        if (points.size > 1) {
-            SeriesCard(
+        if (track.size > 1) {
+            ChartCard(
                 title = "Скорость, км/ч",
-                values = points.map { it.speedKmh },
-                color = MaterialTheme.colorScheme.primary,
-            )
-            SeriesCard(
+                explanation = "PID 0x0D по ходу поездки. Тап или удержание " +
+                    "показывает значение в точке.",
+            ) {
+                InteractiveSeriesChart(
+                    values = track.map { it.speedKmh },
+                    color = Palette.Accent,
+                    unit = "км/ч",
+                )
+            }
+            ChartCard(
                 title = "Расход, л/100 км",
-                values = points.map { it.litersPer100Km },
-                color = MaterialTheme.colorScheme.tertiary,
-            )
-            SeriesCard(
-                title = "Ускорение, м/с² (середина — ноль)",
-                values = points.map { it.accelerationMs2?.plus(ACCEL_SHIFT) },
-                color = MaterialTheme.colorScheme.error,
-                maxOverride = ACCEL_SHIFT * 2,
-            )
+                explanation = "Литры в час, делённые на скорость. Литры в час — " +
+                    "либо PID 0x5E от блока, либо расчёт из расхода воздуха (MAF). " +
+                    "Ниже 3 км/ч величина не определена.",
+            ) {
+                InteractiveSeriesChart(
+                    values = track.map { it.litersPer100Km },
+                    color = Palette.Amber,
+                    unit = "л/100",
+                )
+            }
+            ChartCard(
+                title = "Ускорение, м/с²",
+                explanation = "Наклон скорости по времени методом наименьших " +
+                    "квадратов на окне 1.5 с. Ноль — посередине графика.",
+            ) {
+                InteractiveSeriesChart(
+                    values = track.map { it.accelerationMs2?.plus(ACCEL_SHIFT) },
+                    color = Palette.Coral,
+                    unit = "м/с²",
+                    maxOverride = ACCEL_SHIFT * 2,
+                    valueOffset = -ACCEL_SHIFT,
+                )
+            }
         }
 
         Spacer(Modifier.height(24.dp))
     }
 }
 
+private const val ACCEL_SHIFT = 4.0
+
 @Composable
 private fun Stats(trip: TripEntity) {
     val average = FuelMath.averageLitersPer100Km(trip.fuelLiters, trip.distanceMeters)
-    Card(Modifier.fillMaxWidth().padding(horizontal = 12.dp)) {
-        Column(Modifier.padding(12.dp)) {
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                Cell("Пробег", Fmt.km(trip.distanceMeters))
-                Cell("Топливо", Fmt.liters(trip.fuelLiters))
-                Cell("Средний", Fmt.litersPer100(average))
-            }
-            Spacer(Modifier.height(8.dp))
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                Cell("Макс. скорость", "${Fmt.speed(trip.maxSpeedKmh)} км/ч")
-                Cell("В движении", Fmt.duration(trip.movingMillis))
-                Cell("Стоянка", Fmt.duration(trip.idleMillis))
-            }
-            if (trip.fuelSource.isNotBlank()) {
-                Spacer(Modifier.height(8.dp))
-                Text(
-                    "Расход считался по: ${trip.fuelSource}",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        StatRow {
+            MiniStat(title = "Пробег", value = Fmt.km(trip.distanceMeters), modifier = Modifier.weight(1f))
+            MiniStat(title = "Топливо", value = Fmt.liters(trip.fuelLiters), modifier = Modifier.weight(1f))
+            MiniStat(
+                title = "Средний",
+                value = Fmt.litersPer100(average),
+                modifier = Modifier.weight(1f),
+                accent = Palette.Amber,
+            )
         }
-    }
-}
-
-@Composable
-private fun Cell(title: String, value: String) {
-    Column {
-        Text(title, style = MaterialTheme.typography.labelSmall)
-        Text(value, style = MaterialTheme.typography.titleMedium)
-    }
-}
-
-/** Карточка с графиком по точкам поездки. */
-@Composable
-private fun SeriesCard(
-    title: String,
-    values: List<Double?>,
-    color: Color,
-    maxOverride: Double? = null,
-) {
-    val present = remember(values) { values.filterNotNull() }
-    if (present.isEmpty()) return
-
-    Card(Modifier.fillMaxWidth().padding(12.dp)) {
-        Column(Modifier.padding(12.dp)) {
-            Text(title, style = MaterialTheme.typography.titleSmall)
-            Spacer(Modifier.height(8.dp))
-            SeriesChart(
-                values = values,
-                color = color,
-                modifier = Modifier.fillMaxWidth().height(120.dp),
-                maxOverride = maxOverride,
+        StatRow {
+            MiniStat(
+                title = "Макс. скорость",
+                value = Fmt.speed(trip.maxSpeedKmh),
+                modifier = Modifier.weight(1f),
+            )
+            MiniStat(
+                title = "В движении",
+                value = Fmt.duration(trip.movingMillis),
+                modifier = Modifier.weight(1f),
+            )
+            MiniStat(
+                title = "Стоянка",
+                value = Fmt.duration(trip.idleMillis),
+                modifier = Modifier.weight(1f),
+            )
+        }
+        if (trip.fuelSource.isNotBlank()) {
+            Text(
+                text = "Расход считался по: ${trip.fuelSource}",
+                style = MaterialTheme.typography.labelSmall,
+                color = Palette.TextMuted,
             )
         }
     }
 }
-
-/** На сколько сдвигаем ускорение, чтобы отрицательные значения попали на график. */
-private const val ACCEL_SHIFT = 4.0

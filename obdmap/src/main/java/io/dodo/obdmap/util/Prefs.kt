@@ -12,6 +12,8 @@ object Prefs {
     private const val KEY_DISPLACEMENT = "displacement_l"
     private const val KEY_COLOR_MODE = "color_mode"
     private const val KEY_AUTO_MODE = "auto_mode"
+    private const val KEY_TANK_LITERS = "tank_liters"
+    private const val KEY_MAX_STORAGE = "max_storage_bytes"
     private const val KEY_SPEED_THRESHOLDS = "speed_thresholds"
 
     fun adapterAddress(context: Context): String? =
@@ -36,11 +38,31 @@ object Prefs {
     }
 
     /** Автоматический старт и стоп поездок. */
-    fun autoMode(context: Context): Boolean = prefs(context).getBoolean(KEY_AUTO_MODE, false)
+    fun autoMode(context: Context): Boolean = prefs(context).getBoolean(KEY_AUTO_MODE, true)
 
     fun setAutoMode(context: Context, value: Boolean) {
         prefs(context).edit().putBoolean(KEY_AUTO_MODE, value).apply()
     }
+
+    /** Объём бака в литрах: из процентов делает литры. */
+    fun tankLiters(context: Context): Float = prefs(context).getFloat(KEY_TANK_LITERS, DEFAULT_TANK_LITERS)
+
+    fun setTankLiters(context: Context, value: Float) {
+        prefs(context).edit().putFloat(KEY_TANK_LITERS, value).apply()
+    }
+
+    /** Škoda Rapid 2022 — 55 л. */
+    const val DEFAULT_TANK_LITERS = 55f
+
+    /** Потолок хранилища истории в байтах. */
+    fun maxStorageBytes(context: Context): Long =
+        prefs(context).getLong(KEY_MAX_STORAGE, DEFAULT_MAX_STORAGE_BYTES)
+
+    fun setMaxStorageBytes(context: Context, value: Long) {
+        prefs(context).edit().putLong(KEY_MAX_STORAGE, value).apply()
+    }
+
+    const val DEFAULT_MAX_STORAGE_BYTES = 500L * 1024 * 1024
 
     /** Чем красить траекторию: имя элемента TrackPalette.Mode. */
     fun colorMode(context: Context): String? = prefs(context).getString(KEY_COLOR_MODE, null)

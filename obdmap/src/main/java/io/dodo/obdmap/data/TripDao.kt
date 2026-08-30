@@ -2,6 +2,7 @@ package io.dodo.obdmap.data
 
 import androidx.room.Dao
 import androidx.room.Insert
+import androidx.room.OnConflictStrategy
 import androidx.room.Query
 import androidx.room.Update
 import kotlinx.coroutines.flow.Flow
@@ -11,6 +12,7 @@ data class DriveRow(
     val speedKmh: Double,
     val litersPer100Km: Double,
     val accelerationMs2: Double?,
+    val timeMs: Long,
 )
 
 @Dao
@@ -40,6 +42,30 @@ interface TripDao {
     @Query("DELETE FROM trips WHERE id = :tripId")
     suspend fun deleteTrip(tripId: Long)
 
+    // --- Архив ---------------------------------------------------------------
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertArchive(archive: ArchiveEntity)
+
+    @Query("SELECT * FROM archives WHERE tripId = :tripId")
+    suspend fun archive(tripId: Long): ArchiveEntity?
+
+    @Query("DELETE FROM points WHERE tripId = :tripId")
+    suspend fun deletePoints(tripId: Long)
+
+    @Query("SELECT COUNT(*) FROM points WHERE tripId = :tripId")
+    suspend fun pointCount(tripId: Long): Int
+
+    /** Поездки от старых к новым — в этом порядке и архивируем. */
+    @Query("SELECT id FROM trips WHERE id NOT IN (SELECT tripId FROM archives) ORDER BY startedAt ASC")
+    suspend fun unarchivedTripIds(): List<Long>
+
+    @Query("SELECT COUNT(*) FROM archives")
+    suspend fun archivedCount(): Int
+
+    @Query("SELECT COUNT(*) FROM points")
+    suspend fun totalPoints(): Int
+
     /** Поездки без единой точки только засоряют список — чистим при старте. */
     @Query("DELETE FROM trips WHERE id NOT IN (SELECT DISTINCT tripId FROM points)")
     suspend fun deleteEmptyTrips()
@@ -54,7 +80,8 @@ interface TripDao {
         """
         SELECT speedKmh AS speedKmh,
                litersPer100Km AS litersPer100Km,
-               accelerationMs2 AS accelerationMs2
+               accelerationMs2 AS accelerationMs2,
+               timeMs AS timeMs
         FROM points
         WHERE speedKmh IS NOT NULL
           AND litersPer100Km IS NOT NULL

@@ -1,5 +1,6 @@
 package io.dodo.obdmap.ui
 
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -9,38 +10,36 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.Card
-import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.RangeSlider
 import androidx.compose.material3.Slider
+import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import io.dodo.obdmap.analysis.ConsumptionStats
 import io.dodo.obdmap.analysis.DriveSample
+import io.dodo.obdmap.analysis.Periods
 import io.dodo.obdmap.data.TripDatabase
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import java.util.Locale
 import kotlin.math.roundToInt
 
 /**
- * Разбор истории: какой расход получается на какой скорости.
- *
- * Смысл фильтра по ускорению — отделить установившееся движение от разгонов.
- * Без него медиана «на 60 км/ч» смешивает равномерную езду с разгоном до сотни,
- * и цифра получается бессмысленной.
+ * Разбор истории: какой расход получается на какой скорости, насколько полна
+ * выборка и как кривая менялась от периода к периоду.
  */
 @Composable
 fun AnalysisScreen() {
@@ -49,324 +48,334 @@ fun AnalysisScreen() {
 
     var all by remember { mutableStateOf<List<DriveSample>?>(null) }
     LaunchedEffect(Unit) {
-        all = dao.driveRows(null).map {
-            DriveSample(it.speedKmh, it.litersPer100Km, it.accelerationMs2)
+        all = withContext(Dispatchers.IO) {
+            dao.driveRows(null).map {
+                DriveSample(it.speedKmh, it.litersPer100Km, it.accelerationMs2, it.timeMs)
+            }
         }
     }
 
     // Ниже 20 км/ч мгновенный л/100 км почти бессмысленен: делим на околоноль
     var speedRange by remember { mutableStateOf(20f..140f) }
     var maxAcceleration by remember {
-        mutableStateOf(ConsumptionStats.STEADY_ACCELERATION_MS2.toFloat())
+        mutableFloatStateOf(ConsumptionStats.STEADY_ACCELERATION_MS2.toFloat())
     }
     var filterByAcceleration by remember { mutableStateOf(true) }
-
-    // null — шаг подбирается автоматически по разбросу
     var histogramStep by remember { mutableStateOf<Double?>(null) }
     var speedStep by remember { mutableStateOf(SPEED_BIN_KMH) }
+    var periodMode by remember { mutableStateOf(Periods.Mode.MONTH) }
 
     val samples = all
     if (samples == null) {
-        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text("Читаю историю…") }
+        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            EmptyState("Читаю историю…")
+        }
         return
     }
     if (samples.isEmpty()) {
         Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-            Text(
-                "Нет данных для анализа.\nНужна хотя бы одна поездка с посчитанным расходом.",
-                textAlign = TextAlign.Center,
-                style = MaterialTheme.typography.bodyMedium,
-                modifier = Modifier.padding(24.dp),
-            )
+            EmptyState("Нет данных для анализа.\nНужна поездка с посчитанным расходом.")
         }
         return
     }
+
+    val accelerationLimit = if (filterByAcceleration) maxAcceleration.toDouble() else null
 
     val filtered = remember(samples, speedRange, maxAcceleration, filterByAcceleration) {
         ConsumptionStats.filter(
             samples = samples,
             minSpeedKmh = speedRange.start.toDouble(),
             maxSpeedKmh = speedRange.endInclusive.toDouble(),
-            maxAbsAcceleration = if (filterByAcceleration) maxAcceleration.toDouble() else null,
+            maxAbsAcceleration = accelerationLimit,
         )
     }
-    // Кривая «расход от стабильной скорости» строится по всему диапазону:
-    // ограничение по скорости здесь только мешало бы видеть картину целиком.
-    val bySpeed = remember(samples, maxAcceleration, filterByAcceleration, speedStep) {
-        ConsumptionStats.bySpeedBin(
-            samples = ConsumptionStats.filter(
-                samples = samples,
-                minSpeedKmh = 0.0,
-                maxSpeedKmh = 300.0,
-                maxAbsAcceleration = if (filterByAcceleration) maxAcceleration.toDouble() else null,
-            ),
-            binKmh = speedStep,
-        )
+    val steadyAll = remember(samples, maxAcceleration, filterByAcceleration) {
+        ConsumptionStats.filter(samples, 0.0, 300.0, accelerationLimit)
     }
-    // Обрезаем края: без фильтра по ускорению в выборку попадают разгоны с
-    // расходом в десятки л/100 км, и гистограмма по сырому min..max
-    // превращалась в пустой прямоугольник из сотен корзин.
-    // Сколько замеров вообще знают своё ускорение. Точки старых поездок
-    // записаны до его появления, у них null — и жёсткий фильтр выкидывает их все.
-    val withAcceleration = remember(samples) { samples.count { it.accelerationMs2 != null } }
-    val inSpeedRange = remember(samples, speedRange) {
-        ConsumptionStats.filter(
-            samples = samples,
-            minSpeedKmh = speedRange.start.toDouble(),
-            maxSpeedKmh = speedRange.endInclusive.toDouble(),
-            maxAbsAcceleration = null,
-        ).size
+    val bySpeed = remember(steadyAll, speedStep) {
+        ConsumptionStats.bySpeedBin(steadyAll, binKmh = speedStep)
     }
-
     val histogram = remember(filtered, histogramStep) {
         ConsumptionStats.trimmedHistogram(
             values = filtered.map { it.litersPer100Km },
             binWidth = histogramStep,
         )
     }
+    val speedCoverage = remember(samples, speedStep) {
+        ConsumptionStats.speedHistogram(samples, speedStep)
+    }
+    val periods = remember(steadyAll, periodMode, speedStep) {
+        Periods.groups(steadyAll, periodMode)
+            .map { (label, group) ->
+                label to ConsumptionStats.bySpeedBin(group, binKmh = speedStep)
+            }
+            .filter { it.second.size >= 2 }
+    }
+
+    val withAcceleration = remember(samples) { samples.count { it.accelerationMs2 != null } }
+    val inSpeedRange = remember(samples, speedRange) {
+        ConsumptionStats.filter(
+            samples,
+            speedRange.start.toDouble(),
+            speedRange.endInclusive.toDouble(),
+            null,
+        ).size
+    }
 
     Column(
         modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(12.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
-        Card(Modifier.fillMaxWidth()) {
-            Column(Modifier.padding(12.dp)) {
-                Text(
-                    "Диапазон скорости: ${speedRange.start.roundToInt()}–" +
-                        "${speedRange.endInclusive.roundToInt()} км/ч",
-                    style = MaterialTheme.typography.titleSmall,
-                )
-                RangeSlider(
-                    value = speedRange,
-                    onValueChange = { speedRange = it },
-                    valueRange = 0f..200f,
-                )
 
-                Spacer(Modifier.height(8.dp))
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    FilterChip(
-                        selected = filterByAcceleration,
-                        onClick = { filterByAcceleration = !filterByAcceleration },
-                        label = { Text("Только стабильная скорость") },
-                    )
-                }
-                if (filterByAcceleration) {
-                    Text(
-                        "Максимум |ускорения|: " +
-                            String.format(Locale.US, "%.2f", maxAcceleration) + " м/с²",
-                        style = MaterialTheme.typography.bodySmall,
-                    )
-                    Slider(
-                        value = maxAcceleration,
-                        onValueChange = { maxAcceleration = it },
-                        valueRange = 0.05f..3f,
-                    )
-                    Text(
-                        "Замеры без известного ускорения при этом фильтре отбрасываются: " +
-                            "они могли быть разгоном. Выключи фильтр, чтобы увидеть всё " +
-                            "подряд, включая разгоны и торможения.",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
-            }
-        }
-
-        SampleSummary(
-            total = samples.size,
-            inSpeedRange = inSpeedRange,
-            withAcceleration = withAcceleration,
-            afterFilters = filtered.size,
-            filterOn = filterByAcceleration,
-        )
-
-        Card(Modifier.fillMaxWidth()) {
-            Column(Modifier.padding(12.dp)) {
-                Text("Распределение расхода в диапазоне", style = MaterialTheme.typography.titleSmall)
-                Text(
-                    "замеров: ${filtered.size} из ${samples.size}",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                StepChips(
-                    title = "Шаг, л/100 км",
-                    options = HISTOGRAM_STEPS,
-                    selected = histogramStep,
-                    onSelect = { histogramStep = it },
-                    format = { Fmt.number(it, decimals = if (it < 1) 1 else 0) },
-                )
-                Spacer(Modifier.height(8.dp))
-                if (filtered.size < ConsumptionStats.MIN_BIN_COUNT) {
-                    Text(
-                        text = "Слишком мало замеров. Расширь диапазон скорости, " +
-                            "ослабь фильтр по ускорению или запиши больше поездок. " +
-                            "Всего замеров с расходом в истории: ${samples.size}.",
-                        style = MaterialTheme.typography.bodyMedium,
-                    )
-                } else {
-                    HistogramChart(
-                        bins = histogram,
-                        color = MaterialTheme.colorScheme.primary,
-                        modifier = Modifier.fillMaxWidth().height(160.dp),
-                    )
-                    Spacer(Modifier.height(8.dp))
-                    val values = filtered.map { it.litersPer100Km }
-                    Row(
-                        Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                    ) {
-                        Stat("p25", ConsumptionStats.percentile(values, 0.25))
-                        Stat("медиана", ConsumptionStats.median(values))
-                        Stat("p75", ConsumptionStats.percentile(values, 0.75))
-                    }
-                }
-            }
-        }
-
-        Card(Modifier.fillMaxWidth()) {
-            Column(Modifier.padding(12.dp)) {
-                Text(
-                    "Расход от стабильной скорости",
-                    style = MaterialTheme.typography.titleSmall,
-                )
-                Text(
-                    "медиана линией, коридор p25–p75 заливкой",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                StepChips(
-                    title = "Шаг, км/ч",
-                    options = SPEED_STEPS,
-                    selected = speedStep,
-                    onSelect = { speedStep = it ?: SPEED_BIN_KMH },
-                    format = { Fmt.number(it, decimals = 0) },
-                )
-                Spacer(Modifier.height(8.dp))
-                if (bySpeed.isEmpty()) {
-                    Text(
-                        text = "Ни в один диапазон не набралось " +
-                            "${ConsumptionStats.MIN_BIN_COUNT} замеров. Возьми шаг покрупнее " +
-                            "или ослабь фильтр по ускорению.",
-                        style = MaterialTheme.typography.bodyMedium,
-                    )
-                } else if (bySpeed.size < 2) {
-                    // График по одной точке бессмысленен, но цифру показать честно
-                    Text(
-                        "Пока набрался один диапазон — графика нет, но цифры ниже верны.",
-                        style = MaterialTheme.typography.bodyMedium,
-                    )
-                } else {
-                    SpeedBinChart(
-                        bins = bySpeed,
-                        lineColor = MaterialTheme.colorScheme.primary,
-                        bandColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.2f),
-                        modifier = Modifier.fillMaxWidth().height(180.dp),
-                    )
-                }
-                if (bySpeed.isNotEmpty()) {
-                    Spacer(Modifier.height(8.dp))
-                    bySpeed.forEach { bin ->
-                        Row(
-                            Modifier.fillMaxWidth().padding(vertical = 2.dp),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                        ) {
-                            Text(
-                                "${bin.speedFrom.roundToInt()}–${bin.speedTo.roundToInt()} км/ч",
-                                style = MaterialTheme.typography.bodySmall,
-                            )
-                            Text(
-                                "${Fmt.litersPer100(bin.median)} л/100 · ${bin.count} замеров",
-                                style = MaterialTheme.typography.bodySmall,
-                            )
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-/**
- * Сводка по выборке: сколько замеров осталось после каждого сита.
- * Без неё «данных не хватает» ничего не объясняет.
- */
-@Composable
-private fun SampleSummary(
-    total: Int,
-    inSpeedRange: Int,
-    withAcceleration: Int,
-    afterFilters: Int,
-    filterOn: Boolean,
-) {
-    Card(Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(12.dp)) {
-            Text("Что в выборке", style = MaterialTheme.typography.titleSmall)
+        SectionTitle("Отбор данных")
+        Panel {
             Text(
-                text = "всего замеров с расходом: $total\n" +
-                    "в диапазоне скорости: $inSpeedRange\n" +
-                    "с известным ускорением: $withAcceleration\n" +
-                    "после всех фильтров: $afterFilters",
-                style = MaterialTheme.typography.bodySmall,
+                text = "Скорость ${speedRange.start.roundToInt()}–" +
+                    "${speedRange.endInclusive.roundToInt()} км/ч",
+                style = MaterialTheme.typography.titleSmall,
             )
-            if (filterOn && withAcceleration == 0 && total > 0) {
+            RangeSlider(
+                value = speedRange,
+                onValueChange = { speedRange = it },
+                valueRange = 0f..200f,
+                colors = sliderColors(),
+            )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Pill("Только стабильная скорость", filterByAcceleration) {
+                    filterByAcceleration = !filterByAcceleration
+                }
+            }
+            if (filterByAcceleration) {
                 Spacer(Modifier.height(6.dp))
                 Text(
-                    text = "Ни у одного замера нет ускорения — поездки записаны до того, " +
-                        "как оно появилось. С включённым фильтром они все отбрасываются: " +
-                        "выключи фильтр или запиши новую поездку.",
+                    text = "Максимум |ускорения|: " +
+                        String.format(Locale.US, "%.2f", maxAcceleration) + " м/с²",
                     style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.error,
+                    color = Palette.TextSecondary,
                 )
+                Slider(
+                    value = maxAcceleration,
+                    onValueChange = { maxAcceleration = it },
+                    valueRange = 0.05f..3f,
+                    colors = sliderColors(),
+                )
+            }
+        }
+
+        Panel {
+            SectionTitle("Что в выборке")
+            Spacer(Modifier.height(6.dp))
+            Text(
+                text = "всего замеров с расходом: ${samples.size}\n" +
+                    "в диапазоне скорости: $inSpeedRange\n" +
+                    "с известным ускорением: $withAcceleration\n" +
+                    "после всех фильтров: ${filtered.size}",
+                style = MaterialTheme.typography.bodySmall,
+                color = Palette.TextSecondary,
+            )
+            if (filterByAcceleration && withAcceleration == 0) {
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    text = "Ни у одного замера нет ускорения — поездки записаны до " +
+                        "того, как оно появилось. С включённым фильтром они все " +
+                        "отбрасываются: выключи фильтр или запиши новую поездку.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Palette.Coral,
+                )
+            }
+        }
+
+        SectionTitle("Шаг корзин")
+        Panel {
+            StepPills(
+                title = "Расход, л/100 км",
+                options = HISTOGRAM_STEPS,
+                selected = histogramStep,
+                onSelect = { histogramStep = it },
+            )
+            Spacer(Modifier.height(8.dp))
+            StepPills(
+                title = "Скорость, км/ч",
+                options = SPEED_STEPS,
+                selected = speedStep,
+                onSelect = { speedStep = it ?: SPEED_BIN_KMH },
+            )
+        }
+
+        ChartCard(
+            title = "Распределение расхода",
+            trailing = "${filtered.size} замеров",
+            explanation = "Сколько замеров попало в каждую корзину расхода. Края " +
+                "обрезаются по перцентилям: у границы отсечки по скорости " +
+                "мгновенный расход улетает в сотни л/100 км, и без обрезки " +
+                "гистограмма растянулась бы на тысячу корзин. Замеры выше " +
+                "60 л/100 км отбрасываются как деление на почти ноль. Тап по " +
+                "столбику показывает диапазон и число замеров.",
+        ) {
+            if (filtered.size < ConsumptionStats.MIN_BIN_COUNT) {
+                EmptyState("Слишком мало замеров — расширь диапазон или ослабь фильтр.")
+            } else {
+                HistogramChart(bins = histogram, color = Palette.Amber, unit = "л/100")
+                Spacer(Modifier.height(8.dp))
+                val values = filtered.map { it.litersPer100Km }
+                StatRow {
+                    MiniStat(
+                        title = "p25",
+                        value = Fmt.litersPer100(ConsumptionStats.percentile(values, 0.25)),
+                        modifier = Modifier.weight(1f),
+                    )
+                    MiniStat(
+                        title = "медиана",
+                        value = Fmt.litersPer100(ConsumptionStats.median(values)),
+                        modifier = Modifier.weight(1f),
+                        accent = Palette.Amber,
+                    )
+                    MiniStat(
+                        title = "p75",
+                        value = Fmt.litersPer100(ConsumptionStats.percentile(values, 0.75)),
+                        modifier = Modifier.weight(1f),
+                    )
+                }
+            }
+        }
+
+        ChartCard(
+            title = "Полнота выборки по скорости",
+            trailing = "${samples.size} замеров",
+            explanation = "Сколько замеров есть на каждой скорости. По этому " +
+                "графику видно, каким участкам кривой расхода можно верить: там, " +
+                "где столбик низкий, медиана посчитана по нескольким точкам. " +
+                "Фильтры сюда не применяются — это вся история целиком.",
+        ) {
+            if (speedCoverage.isEmpty()) {
+                EmptyState("Нет данных")
+            } else {
+                HistogramChart(bins = speedCoverage, color = Palette.Accent, unit = "км/ч")
+            }
+        }
+
+        ChartCard(
+            title = "Расход от стабильной скорости",
+            trailing = "шаг ${speedStep.roundToInt()} км/ч",
+            explanation = "Медиана расхода в каждой корзине скорости, линией. " +
+                "Заливка — коридор от p25 до p75: по нему видно, где разброс " +
+                "велик и цифре верить нельзя. Корзины меньше " +
+                "${ConsumptionStats.MIN_BIN_COUNT} замеров отбрасываются. Тап по " +
+                "графику показывает подробности корзины.",
+        ) {
+            when {
+                bySpeed.isEmpty() -> EmptyState(
+                    "Ни в один диапазон не набралось ${ConsumptionStats.MIN_BIN_COUNT} " +
+                        "замеров. Возьми шаг покрупнее или ослабь фильтр.",
+                )
+
+                bySpeed.size < 2 -> Text(
+                    "Набрался один диапазон — графика нет, но цифры ниже верны.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Palette.TextSecondary,
+                )
+
+                else -> SpeedBinChart(
+                    bins = bySpeed,
+                    lineColor = Palette.Accent,
+                    bandColor = Palette.Accent.copy(alpha = 0.18f),
+                )
+            }
+            if (bySpeed.isNotEmpty()) {
+                Spacer(Modifier.height(8.dp))
+                bySpeed.forEach { bin ->
+                    Row(
+                        Modifier.fillMaxWidth().padding(vertical = 2.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                    ) {
+                        Text(
+                            "${bin.speedFrom.roundToInt()}–${bin.speedTo.roundToInt()} км/ч",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = Palette.TextSecondary,
+                        )
+                        Text(
+                            "${Fmt.litersPer100(bin.median)} л/100 · ${bin.count}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = Palette.TextPrimary,
+                        )
+                    }
+                }
+            }
+        }
+
+        SectionTitle("Сравнение периодов")
+        Panel {
+            Row(
+                modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                Periods.Mode.entries.forEach { mode ->
+                    Pill(mode.title, periodMode == mode) { periodMode = mode }
+                }
+            }
+        }
+        ChartCard(
+            title = "Кривая расхода по периодам",
+            trailing = "${periods.size} кривых",
+            explanation = "Та же зависимость расхода от скорости, но отдельно для " +
+                "каждого периода. Так видно, что кривая поднялась или изогнулась: " +
+                "зимой, на другом бензине, после смены резины. Показываем не " +
+                "больше ${Periods.DEFAULT_MAX_GROUPS} периодов — иначе линии " +
+                "сливаются. Отбор данных тот же, что и выше, но без ограничения " +
+                "по диапазону скорости.",
+        ) {
+            if (periods.size < 2) {
+                EmptyState(
+                    "Нужны хотя бы два периода с достаточным числом замеров. " +
+                        "Попробуй другую разбивку или накопи больше поездок.",
+                )
+            } else {
+                MultiSpeedBinChart(
+                    series = periods,
+                    colors = listOf(Palette.Accent, Palette.Amber, Palette.Coral, Palette.TextSecondary),
+                )
+            }
+        }
+
+        Spacer(Modifier.height(24.dp))
+    }
+}
+
+@Composable
+private fun StepPills(
+    title: String,
+    options: List<Double?>,
+    selected: Double?,
+    onSelect: (Double?) -> Unit,
+) {
+    Column {
+        Text(title, style = MaterialTheme.typography.labelSmall, color = Palette.TextMuted)
+        Spacer(Modifier.height(4.dp))
+        Row(
+            modifier = Modifier.horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            options.forEach { option ->
+                Pill(
+                    text = option?.let { Fmt.number(it, if (it < 1) 1 else 0) } ?: "авто",
+                    selected = selected == option,
+                ) { onSelect(option) }
             }
         }
     }
 }
+
+@Composable
+private fun sliderColors() = SliderDefaults.colors(
+    thumbColor = Palette.Accent,
+    activeTrackColor = Palette.Accent,
+    inactiveTrackColor = Palette.Outline,
+)
 
 private const val SPEED_BIN_KMH = 5.0
 
 /** Шаги гистограммы расхода; null — автоматический подбор. */
 private val HISTOGRAM_STEPS = listOf(null, 0.2, 0.5, 1.0, 2.0)
 
-/** Шаги корзин по скорости. Крупнее 5 км/ч смысла нет — картина смазывается. */
-private val SPEED_STEPS = listOf(1.0, 2.0, 5.0)
-
-/**
- * Ряд чипов для выбора шага. [selected] == null означает автоматический
- * подбор, если он есть среди [options].
- */
-@Composable
-private fun StepChips(
-    title: String,
-    options: List<Double?>,
-    selected: Double?,
-    onSelect: (Double?) -> Unit,
-    format: (Double) -> String,
-) {
-    Column(Modifier.padding(top = 4.dp)) {
-        Text(title, style = MaterialTheme.typography.labelSmall)
-        Row(
-            modifier = Modifier.horizontalScroll(rememberScrollState()),
-            horizontalArrangement = Arrangement.spacedBy(6.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            options.forEach { option ->
-                FilterChip(
-                    selected = selected == option,
-                    onClick = { onSelect(option) },
-                    label = { Text(option?.let(format) ?: "авто") },
-                )
-            }
-        }
-    }
-}
-
-@Composable
-private fun Stat(title: String, value: Double?) {
-    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-        Text(title, style = MaterialTheme.typography.labelSmall)
-        Text(
-            "${Fmt.litersPer100(value)} л/100",
-            style = MaterialTheme.typography.titleMedium,
-        )
-    }
-}
+/** Шаги корзин по скорости. Крупнее 5 км/ч картина смазывается. */
+private val SPEED_STEPS = listOf<Double?>(1.0, 2.0, 5.0)

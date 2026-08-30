@@ -45,9 +45,11 @@ fun MapCacheCard(modifier: Modifier = Modifier) {
         sizeBytes = withContext(Dispatchers.IO) { directorySize(cacheDir) }
     }
 
-    Card(modifier.fillMaxWidth()) {
-        Column(Modifier.padding(12.dp)) {
-            Text("Офлайн-карта", style = MaterialTheme.typography.titleSmall)
+    Column(modifier.fillMaxWidth()) {
+        SectionTitle("Офлайн-карта")
+        Spacer(Modifier.height(8.dp))
+        Panel {
+            Text("Кеш тайлов", style = MaterialTheme.typography.titleSmall)
             Spacer(Modifier.height(4.dp))
             Text(
                 text = if (sizeBytes < 0) {
@@ -57,15 +59,17 @@ fun MapCacheCard(modifier: Modifier = Modifier) {
                         "открывается потом без сети."
                 },
                 style = MaterialTheme.typography.bodySmall,
+                color = Palette.TextSecondary,
             )
             Spacer(Modifier.height(4.dp))
             Text(
                 text = "Пакетная выкачка области не делается: сервер тайлов OSM её запрещает.",
                 style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                color = Palette.TextMuted,
             )
-            Spacer(Modifier.height(8.dp))
-            OutlinedButton(
+            Spacer(Modifier.height(10.dp))
+            GhostButton(
+                text = "Очистить кеш",
                 onClick = {
                     runCatching { cacheDir.deleteRecursively() }
                         .onFailure { Logger.error("не смог очистить кеш карт", it) }
@@ -73,9 +77,8 @@ fun MapCacheCard(modifier: Modifier = Modifier) {
                     reloadKey++
                 },
                 enabled = sizeBytes > 0,
-            ) {
-                Text("Очистить кеш")
-            }
+                modifier = Modifier.fillMaxWidth(),
+            )
         }
     }
 }

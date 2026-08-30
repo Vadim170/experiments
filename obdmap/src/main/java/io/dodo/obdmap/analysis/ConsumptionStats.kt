@@ -9,6 +9,8 @@ data class DriveSample(
     val speedKmh: Double,
     val litersPer100Km: Double,
     val accelerationMs2: Double?,
+    /** Момент замера — нужен только для сравнения периодов. */
+    val timeMs: Long = 0,
 )
 
 /** Столбик гистограммы: полуинтервал [from, to) и сколько замеров в него попало. */
@@ -149,6 +151,17 @@ object ConsumptionStats {
         return counts.mapIndexed { index, count ->
             HistogramBin(min + index * binWidth, min + (index + 1) * binWidth, count)
         }
+    }
+
+    /**
+     * Сколько замеров приходится на каждую корзину скорости.
+     *
+     * Отвечает на вопрос «а можно ли верить кривой вот тут»: там, где столбик
+     * низкий, медиана посчитана по горстке точек.
+     */
+    fun speedHistogram(samples: List<DriveSample>, binKmh: Double): List<HistogramBin> {
+        if (samples.isEmpty() || binKmh <= 0) return emptyList()
+        return histogram(samples.map { it.speedKmh }, binKmh)
     }
 
     /** Медиана. Для чётной длины — среднее двух середин. */

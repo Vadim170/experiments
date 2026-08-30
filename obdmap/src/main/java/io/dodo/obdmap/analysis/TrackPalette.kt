@@ -34,11 +34,7 @@ object TrackPalette {
      * некорректный список молча заменяется значениями по умолчанию.
      */
     fun speedBands(thresholds: List<Double> = DEFAULT_SPEED_THRESHOLDS): List<Band> {
-        val t = if (thresholds.size == 4 && thresholds.zipWithNext().all { it.first < it.second }) {
-            thresholds
-        } else {
-            DEFAULT_SPEED_THRESHOLDS
-        }
+        val t = validThresholds(thresholds)
         return listOf(
             Band(t[0], GREY, "< ${fmt(t[0])}"),
             Band(t[1], GREEN, "${fmt(t[0])}–${fmt(t[1])}"),
@@ -84,6 +80,114 @@ object TrackPalette {
         return list.firstOrNull { band -> band.upTo != null && value < band.upTo }?.color
             ?: list.last().color
     }
+
+    /**
+     * Опорные точки градиента: значение и цвет в нём. Между ними цвет
+     * интерполируется покомпонентно, за краями — берётся крайний.
+     */
+    data class Stop(val value: Double, val color: Int)
+
+    fun stops(mode: Mode, speedThresholds: List<Double> = DEFAULT_SPEED_THRESHOLDS): List<Stop> =
+        when (mode) {
+            Mode.SPEED -> {
+                val t = validThresholds(speedThresholds)
+                listOf(
+                    Stop(0.0, GREY),
+                    Stop(t[0], CYAN),
+                    Stop(t[1], GREEN),
+                    Stop(t[2], YELLOW),
+                    Stop(t[3], ORANGE),
+                    Stop(t[3] * 1.4, RED),
+                )
+            }
+
+            Mode.CONSUMPTION -> listOf(
+                Stop(3.0, GREEN),
+                Stop(6.0, LIME),
+                Stop(9.0, YELLOW),
+                Stop(14.0, ORANGE),
+                Stop(22.0, RED),
+            )
+
+            Mode.ACCELERATION -> listOf(
+                Stop(-3.0, PURPLE),
+                Stop(-1.0, CYAN),
+                Stop(0.0, GREY),
+                Stop(1.0, ORANGE),
+                Stop(3.0, RED),
+            )
+        }
+
+    /**
+     * Цвет по градиенту. Плавный переход честнее полос: на границе полосы
+     * трек менял цвет скачком там, где скорость изменилась на километр в час.
+     */
+    fun gradientColor(
+        mode: Mode,
+        value: Double?,
+        speedThresholds: List<Double> = DEFAULT_SPEED_THRESHOLDS,
+    ): Int {
+        if (value == null) return GREY
+        val list = stops(mode, speedThresholds)
+        if (value <= list.first().value) return list.first().color
+        if (value >= list.last().value) return list.last().color
+
+        val upperIndex = list.indexOfFirst { it.value >= value }
+        val upper = list[upperIndex]
+        val lower = list[upperIndex - 1]
+        val span = upper.value - lower.value
+        val fraction = if (span <= 0) 0.0 else (value - lower.value) / span
+        return blend(lower.color, upper.color, fraction)
+    }
+
+    /**
+     * Квантование градиента для карты.
+     *
+     * Рисовать по отрезку на точку нельзя — это тысячи оверлеев. Поэтому цвет
+     * округляется до [GRADIENT_STEPS] ступеней: соседние точки чаще всего
+     * попадают в одну и склеиваются в общую ломаную, а глазу переход всё равно
+     * читается как плавный.
+     */
+    fun quantizedGradientColor(
+        mode: Mode,
+        value: Double?,
+        speedThresholds: List<Double> = DEFAULT_SPEED_THRESHOLDS,
+        steps: Int = GRADIENT_STEPS,
+    ): Int {
+        if (value == null) return GREY
+        val list = stops(mode, speedThresholds)
+        val min = list.first().value
+        val max = list.last().value
+        val clamped = value.coerceIn(min, max)
+        val bucket = if (max <= min) {
+            0
+        } else {
+            ((clamped - min) / (max - min) * steps).toInt().coerceIn(0, steps)
+        }
+        val quantized = min + (max - min) * bucket / steps
+        return gradientColor(mode, quantized, speedThresholds)
+    }
+
+    /** Сколько ступеней в квантованном градиенте. */
+    const val GRADIENT_STEPS = 24
+
+    /** Линейная интерполяция двух ARGB-цветов. */
+    fun blend(from: Int, to: Int, fraction: Double): Int {
+        val f = fraction.coerceIn(0.0, 1.0)
+        fun channel(shift: Int): Int {
+            val a = (from shr shift) and 0xFF
+            val b = (to shr shift) and 0xFF
+            return (a + (b - a) * f).toInt().coerceIn(0, 255)
+        }
+        return (channel(24) shl 24) or (channel(16) shl 16) or (channel(8) shl 8) or channel(0)
+    }
+
+    private fun validThresholds(thresholds: List<Double>): List<Double> =
+        if (thresholds.size == 4 && thresholds.zipWithNext().all { it.first < it.second }) {
+            thresholds
+        } else {
+            DEFAULT_SPEED_THRESHOLDS
+        }
 
     private fun fmt(value: Double): String =
         if (value == value.toLong().toDouble()) value.toLong().toString() else value.toString()

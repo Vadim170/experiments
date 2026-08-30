@@ -7,7 +7,11 @@ import androidx.room.RoomDatabase
 import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
 
-@Database(entities = [TripEntity::class, PointEntity::class], version = 2, exportSchema = false)
+@Database(
+    entities = [TripEntity::class, PointEntity::class, ArchiveEntity::class],
+    version = 3,
+    exportSchema = false,
+)
 abstract class TripDatabase : RoomDatabase() {
 
     abstract fun tripDao(): TripDao
@@ -25,6 +29,23 @@ abstract class TripDatabase : RoomDatabase() {
             }
         }
 
+        /** Архив старых треков появился в третьей версии. */
+        private val MIGRATION_2_3 = object : Migration(2, 3) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS archives (
+                        tripId INTEGER NOT NULL PRIMARY KEY,
+                        pointCount INTEGER NOT NULL,
+                        originalCount INTEGER NOT NULL,
+                        data BLOB NOT NULL,
+                        FOREIGN KEY(tripId) REFERENCES trips(id) ON DELETE CASCADE
+                    )
+                    """.trimIndent(),
+                )
+            }
+        }
+
         @Volatile
         private var instance: TripDatabase? = null
 
@@ -33,7 +54,7 @@ abstract class TripDatabase : RoomDatabase() {
                 context.applicationContext,
                 TripDatabase::class.java,
                 "trips.db",
-            ).addMigrations(MIGRATION_1_2).build().also { instance = it }
+            ).addMigrations(MIGRATION_1_2, MIGRATION_2_3).build().also { instance = it }
         }
     }
 }

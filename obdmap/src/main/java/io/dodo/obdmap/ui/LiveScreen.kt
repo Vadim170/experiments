@@ -11,24 +11,16 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.Button
-import androidx.compose.material3.Card
-import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.FilterChip
-import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -36,14 +28,9 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import io.dodo.obdmap.analysis.TrackPalette
 import io.dodo.obdmap.obd.AdapterPicker
@@ -61,9 +48,10 @@ fun LiveScreen(
     savedAdapterName: String?,
     savedAdapterAddress: String?,
     autoMode: Boolean,
+    openPicker: Boolean,
+    onPickerHandled: () -> Unit,
     onRequestPermissions: () -> Unit,
     onPickAdapter: (address: String, name: String?) -> Unit,
-    onSetAutoMode: (Boolean) -> Unit,
     onStart: () -> Unit,
     onStop: () -> Unit,
     onStartScan: () -> Unit,
@@ -75,6 +63,13 @@ fun LiveScreen(
     val series by TripSession.series.collectAsStateWithLifecycle()
 
     var pickerOpen by remember { mutableStateOf(false) }
+    LaunchedEffect(openPicker) {
+        if (openPicker) {
+            pickerOpen = true
+            onPickerHandled()
+        }
+    }
+
     var showCharts by rememberSaveable { mutableStateOf(false) }
     var colorMode by rememberSaveable {
         mutableStateOf(
@@ -84,61 +79,66 @@ fun LiveScreen(
         )
     }
     val speedThresholds = remember { Prefs.speedThresholds(context) }
+    val tankLiters = remember { Prefs.tankLiters(context) }
 
     val busy = live.connection != ConnectionState.IDLE
-    val recording = live.connection == ConnectionState.LIVE
 
     Column(Modifier.fillMaxSize()) {
 
         if (!permissionsGranted) {
-            Card(
-                modifier = Modifier.fillMaxWidth().padding(12.dp),
-                colors = CardDefaults.cardColors(
-                    containerColor = MaterialTheme.colorScheme.errorContainer,
-                ),
-            ) {
-                Column(Modifier.padding(12.dp)) {
-                    Text(
-                        "Нужны разрешения: Bluetooth, геолокация, уведомления",
-                        style = MaterialTheme.typography.titleSmall,
-                    )
-                    Spacer(Modifier.height(8.dp))
-                    Button(onClick = onRequestPermissions) { Text("Выдать") }
+            Panel(Modifier.fillMaxWidth().padding(12.dp), accent = Palette.Coral) {
+                Text(
+                    "Нужны разрешения: Bluetooth, геолокация, уведомления",
+                    style = MaterialTheme.typography.titleSmall,
+                )
+                Spacer(Modifier.height(10.dp))
+                ActionButton("Выдать", onClick = onRequestPermissions)
+            }
+        }
+
+        StatusStrip(live)
+        Gauges(live, tankLiters)
+        Spacer(Modifier.height(8.dp))
+        TripStrip(live)
+        Spacer(Modifier.height(8.dp))
+
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .horizontalScroll(rememberScrollState())
+                .padding(horizontal = 12.dp),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Pill("Карта", !showCharts) { showCharts = false }
+            Pill("Графики", showCharts) { showCharts = true }
+            if (!showCharts) {
+                TrackPalette.Mode.entries.forEach { mode ->
+                    Pill(mode.title, colorMode == mode) {
+                        colorMode = mode
+                        Prefs.setColorMode(context, mode.name)
+                    }
                 }
             }
         }
 
-        StatusRow(live)
-        Gauges(live)
-        Spacer(Modifier.height(6.dp))
-        TripSummary(live)
-        Spacer(Modifier.height(6.dp))
-        ViewSwitch(
-            showCharts = showCharts,
-            onShowCharts = { showCharts = it },
-            colorMode = colorMode,
-            onColorMode = {
-                colorMode = it
-                Prefs.setColorMode(context, it.name)
-            },
-        )
-
-        // Карте отдаём всё оставшееся место, но не меньше минимума: иначе на
-        // низком экране она схлопывается в ноль.
         Box(
             Modifier
                 .weight(1f)
                 .heightIn(min = 160.dp)
                 .fillMaxWidth()
-                .padding(top = 6.dp),
+                .padding(top = 8.dp),
         ) {
             when {
                 showCharts -> CurrentTripCharts(series)
 
-                track.isEmpty() -> Hint(
+                track.isEmpty() -> EmptyState(
                     if (busy) {
-                        "Жду координаты — трек появится, как только поймается GPS.\n" +
+                        "Жду координаты — трек появится, как только поймается GPS. " +
                             "Показания и графики уже пишутся."
+                    } else if (autoMode) {
+                        "Автоматический режим включён. Поездка начнётся сама, " +
+                            "когда заведёшь мотор."
                     } else {
                         "Выбери адаптер и начни поездку"
                     },
@@ -161,10 +161,10 @@ fun LiveScreen(
                         followLast = true,
                         showVehicle = true,
                     )
-                    PaletteLegend(
+                    GradientLegend(
                         mode = colorMode,
                         speedThresholds = speedThresholds,
-                        modifier = Modifier.padding(vertical = 4.dp),
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
                     )
                 }
             }
@@ -175,9 +175,7 @@ fun LiveScreen(
             savedAdapterAddress = savedAdapterAddress,
             autoMode = autoMode,
             busy = busy,
-            recording = recording,
             onPickerOpen = { pickerOpen = true; onStartScan() },
-            onSetAutoMode = onSetAutoMode,
             onStart = onStart,
             onStop = onStop,
         )
@@ -198,138 +196,113 @@ fun LiveScreen(
     }
 }
 
-/**
- * Показания. Две крупные плитки — то, на что смотрят за рулём, под ними
- * четыре мелких. Каждая плитка занимает равную долю ширины и режет длинный
- * текст: иначе одно большое число разъезжает всю строку.
- */
+/** Полоса состояния: точка, текст, протокол и что ответили PID. */
 @Composable
-private fun Gauges(live: LiveState) {
+private fun StatusStrip(live: LiveState) {
+    val color = when (live.connection) {
+        ConnectionState.LIVE -> Palette.Accent
+        ConnectionState.ERROR -> Palette.Coral
+        ConnectionState.IDLE -> Palette.TextMuted
+        else -> Palette.Amber
+    }
+    Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            StatusDot(color)
+            Spacer(Modifier.width(8.dp))
+            Text(
+                text = live.status,
+                style = MaterialTheme.typography.bodySmall,
+                color = if (live.connection == ConnectionState.ERROR) {
+                    Palette.Coral
+                } else {
+                    Palette.TextSecondary
+                },
+            )
+        }
+        val details = listOfNotNull(
+            live.protocol.takeIf { it.isNotBlank() },
+            live.diagnostics.takeIf { it.isNotBlank() },
+        )
+        if (details.isNotEmpty()) {
+            Text(
+                text = details.joinToString(" · "),
+                style = MaterialTheme.typography.labelSmall,
+                color = Palette.TextMuted,
+            )
+        }
+    }
+}
+
+@Composable
+private fun Gauges(live: LiveState, tankLiters: Float) {
     Row(
         modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp),
         horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        BigTile(
+        Readout(
             modifier = Modifier.weight(1f),
+            caption = "Скорость",
             value = Fmt.speed(live.speedKmh),
             unit = "км/ч",
         )
-        // На стоянке л/100 км не определён (деление на ноль), поэтому крупно
-        // показываем л/ч, а не прочерк.
+        // На стоянке л/100 км не определён — крупно показываем л/ч, а не прочерк
         val showPerHour = live.litersPer100Km == null && live.fuelRateLitersPerHour != null
-        BigTile(
+        Readout(
             modifier = Modifier.weight(1f),
+            caption = "Расход",
             value = if (showPerHour) {
                 Fmt.number(live.fuelRateLitersPerHour, decimals = 2)
             } else {
                 Fmt.number(live.litersPer100Km)
             },
-            unit = if (showPerHour) "л/ч (стоим)" else "л/100 км",
+            unit = if (showPerHour) "л/ч · стоим" else "л/100 км",
+            accent = Palette.Amber,
         )
     }
 
-    Spacer(Modifier.height(6.dp))
+    Spacer(Modifier.height(8.dp))
 
-    Row(
-        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp),
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-    ) {
-        SmallTile(Modifier.weight(1f), "Ускорение", Fmt.acceleration(live.accelerationMs2), "м/с²")
-        SmallTile(Modifier.weight(1f), "Обороты", Fmt.rpm(live.rpm), "об/мин")
-        SmallTile(Modifier.weight(1f), "Бак", Fmt.percent(live.fuelLevelPercent), "")
-        SmallTile(Modifier.weight(1f), "Двигатель", Fmt.temp(live.coolantTempC), "")
+    StatRow(Modifier.padding(horizontal = 12.dp)) {
+        MiniStat(title = "Ускор.", value = Fmt.acceleration(live.accelerationMs2), modifier = Modifier.weight(1f))
+        MiniStat(title = "Обороты", value = Fmt.rpm(live.rpm), modifier = Modifier.weight(1f))
+        MiniStat(title = "Бак", value = fuelText(live.fuelLevelPercent, tankLiters), modifier = Modifier.weight(1f))
+        MiniStat(title = "Двиг.", value = Fmt.temp(live.coolantTempC), modifier = Modifier.weight(1f))
     }
-}
-
-@Composable
-private fun BigTile(value: String, unit: String, modifier: Modifier = Modifier) {
-    Card(modifier) {
-        Column(
-            modifier = Modifier.fillMaxWidth().padding(vertical = 10.dp, horizontal = 4.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-        ) {
-            Text(
-                text = value,
-                fontSize = 40.sp,
-                fontWeight = FontWeight.Bold,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-            Text(
-                text = unit,
-                style = MaterialTheme.typography.bodySmall,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-        }
-    }
-}
-
-@Composable
-private fun SmallTile(modifier: Modifier, title: String, value: String, unit: String) {
-    Card(modifier) {
-        Column(
-            modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp, horizontal = 4.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-        ) {
-            Text(
-                text = title,
-                style = MaterialTheme.typography.labelSmall,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-            Text(
-                text = value,
-                style = MaterialTheme.typography.titleMedium,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-            if (unit.isNotEmpty()) {
-                Text(
-                    text = unit,
-                    style = MaterialTheme.typography.labelSmall,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-            }
-        }
-    }
-}
-
-@Composable
-private fun ViewSwitch(
-    showCharts: Boolean,
-    onShowCharts: (Boolean) -> Unit,
-    colorMode: TrackPalette.Mode,
-    onColorMode: (TrackPalette.Mode) -> Unit,
-) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .horizontalScroll(rememberScrollState())
-            .padding(horizontal = 12.dp),
-        horizontalArrangement = Arrangement.spacedBy(6.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        FilterChip(
-            selected = !showCharts,
-            onClick = { onShowCharts(false) },
-            label = { Text("Карта") },
+    if (live.fuelLevelPercent != null) {
+        Text(
+            text = fuelDetail(live.fuelLevelPercent, tankLiters),
+            style = MaterialTheme.typography.labelSmall,
+            color = Palette.TextMuted,
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
         )
-        FilterChip(
-            selected = showCharts,
-            onClick = { onShowCharts(true) },
-            label = { Text("Графики") },
+    }
+}
+
+/** В плитке — литры: процент сам по себе мало что говорит. */
+private fun fuelText(percent: Double?, tankLiters: Float): String {
+    if (percent == null) return "—"
+    return "${Fmt.number(percent / 100.0 * tankLiters)} л"
+}
+
+private fun fuelDetail(percent: Double, tankLiters: Float): String {
+    val inTank = percent / 100.0 * tankLiters
+    val free = tankLiters - inTank
+    return "Бак ${Fmt.number(percent, 0)}% · залито ${Fmt.number(inTank)} л · " +
+        "свободно ${Fmt.number(free)} л из ${tankLiters.toInt()} л"
+}
+
+@Composable
+private fun TripStrip(live: LiveState) {
+    StatRow(Modifier.padding(horizontal = 12.dp)) {
+        MiniStat(title = "Пробег", value = Fmt.km(live.stats.distanceMeters), modifier = Modifier.weight(1f))
+        MiniStat(title = "Топливо", value = Fmt.liters(live.stats.fuelLiters), modifier = Modifier.weight(1f))
+        MiniStat(
+            title = "Средний",
+            value = Fmt.litersPer100(live.stats.averageLitersPer100Km),
+            modifier = Modifier.weight(1f),
+            accent = Palette.Amber,
         )
-        if (!showCharts) {
-            TrackPalette.Mode.entries.forEach { mode ->
-                FilterChip(
-                    selected = colorMode == mode,
-                    onClick = { onColorMode(mode) },
-                    label = { Text(mode.title) },
-                )
-            }
-        }
+        MiniStat(title = "В пути", value = Fmt.duration(live.stats.durationMillis), modifier = Modifier.weight(1f))
     }
 }
 
@@ -339,76 +312,39 @@ private fun Controls(
     savedAdapterAddress: String?,
     autoMode: Boolean,
     busy: Boolean,
-    recording: Boolean,
     onPickerOpen: () -> Unit,
-    onSetAutoMode: (Boolean) -> Unit,
     onStart: () -> Unit,
     onStop: () -> Unit,
 ) {
-    Column(Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Column(Modifier.weight(1f)) {
-                Text("Автоматический режим", style = MaterialTheme.typography.bodyMedium)
-                Text(
-                    "Поездка начнётся сама, когда заведёшь мотор",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-            Switch(
-                checked = autoMode,
-                onCheckedChange = onSetAutoMode,
-                enabled = savedAdapterAddress != null,
-            )
+    Column(Modifier.padding(12.dp)) {
+        if (savedAdapterAddress == null) {
+            ActionButton("Выбрать адаптер", onClick = onPickerOpen, modifier = Modifier.fillMaxWidth())
+            return@Column
         }
-
-        Spacer(Modifier.height(6.dp))
-        OutlinedButton(
-            onClick = onPickerOpen,
-            modifier = Modifier.fillMaxWidth(),
-            enabled = !busy,
-        ) {
+        // В автоматическом режиме кнопки не нужны: всё решает сервис
+        if (autoMode) {
             Text(
-                text = savedAdapterName?.let { "Адаптер: $it" }
-                    ?: savedAdapterAddress?.let { "Адаптер: $it" }
-                    ?: "Выбрать адаптер",
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
+                text = "Автоматический режим · ${savedAdapterName ?: savedAdapterAddress}",
+                style = MaterialTheme.typography.labelSmall,
+                color = Palette.TextMuted,
             )
-        }
-
-        // В автоматическом режиме кнопка не нужна: режимом управляет переключатель
-        if (!autoMode) {
             Spacer(Modifier.height(6.dp))
-            if (busy) {
-                Button(onClick = onStop, modifier = Modifier.fillMaxWidth()) {
-                    Text(if (recording) "Завершить поездку" else "Отменить")
-                }
-            } else {
-                Button(
-                    onClick = onStart,
-                    modifier = Modifier.fillMaxWidth(),
-                    enabled = savedAdapterAddress != null,
-                ) {
-                    Text("Начать поездку")
-                }
-            }
+            GhostButton(
+                text = "Сменить адаптер",
+                onClick = onPickerOpen,
+                modifier = Modifier.fillMaxWidth(),
+                enabled = !busy,
+            )
+        } else if (busy) {
+            ActionButton(
+                text = "Завершить поездку",
+                onClick = onStop,
+                modifier = Modifier.fillMaxWidth(),
+                danger = true,
+            )
+        } else {
+            ActionButton("Начать поездку", onClick = onStart, modifier = Modifier.fillMaxWidth())
         }
-    }
-}
-
-@Composable
-private fun Hint(text: String) {
-    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-        Text(
-            text = text,
-            textAlign = TextAlign.Center,
-            style = MaterialTheme.typography.bodyMedium,
-            modifier = Modifier.padding(24.dp),
-        )
     }
 }
 
@@ -416,40 +352,59 @@ private fun Hint(text: String) {
 @Composable
 private fun CurrentTripCharts(series: List<LiveSample>) {
     if (series.size < 2) {
-        Hint("Данных пока нет — графики появятся через несколько секунд записи")
+        EmptyState("Данных пока нет — графики появятся через несколько секунд записи")
         return
     }
 
     Column(
         modifier = Modifier.fillMaxSize().padding(horizontal = 12.dp),
-        verticalArrangement = Arrangement.spacedBy(6.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        ChartBlock("Скорость, км/ч", MaterialTheme.colorScheme.primary, Modifier.weight(1f)) {
-            SeriesChart(
-                values = series.map { it.speedKmh },
-                color = MaterialTheme.colorScheme.primary,
-                modifier = Modifier.fillMaxSize(),
-            )
-        }
-        ChartBlock("Расход, л/100 км", MaterialTheme.colorScheme.tertiary, Modifier.weight(1f)) {
-            SeriesChart(
-                values = series.map { it.litersPer100Km },
-                color = MaterialTheme.colorScheme.tertiary,
-                modifier = Modifier.fillMaxSize(),
-            )
-        }
-        ChartBlock(
-            "Ускорение, м/с² (середина — ноль)",
-            MaterialTheme.colorScheme.error,
-            Modifier.weight(1f),
+        ChartCard(
+            title = "Скорость, км/ч",
+            explanation = "PID 0x0D, целые км/ч прямо с шины. Точка ставится в " +
+                "каждом цикле опроса; провалы — это циклы, где блок не ответил.",
+            modifier = Modifier.weight(1f),
         ) {
-            // SeriesChart рисует от нуля вверх, а ускорение бывает отрицательным:
-            // сдвигаем в положительную область и подписываем это в заголовке.
-            SeriesChart(
+            InteractiveSeriesChart(
+                values = series.map { it.speedKmh },
+                color = Palette.Accent,
+                unit = "км/ч",
+                modifier = Modifier.fillMaxSize(),
+            )
+        }
+        ChartCard(
+            title = "Расход, л/100 км",
+            explanation = "Мгновенный расход: литры в час, делённые на скорость. " +
+                "Литры в час берутся от PID 0x5E, если блок его отдаёт, иначе " +
+                "считаются из расхода воздуха (MAF) по стехиометрии 14.7 и " +
+                "плотности бензина 745 г/л. Ниже 3 км/ч величина не определена и " +
+                "на графике её нет.",
+            modifier = Modifier.weight(1f),
+        ) {
+            InteractiveSeriesChart(
+                values = series.map { it.litersPer100Km },
+                color = Palette.Amber,
+                unit = "л/100",
+                modifier = Modifier.fillMaxSize(),
+            )
+        }
+        ChartCard(
+            title = "Ускорение, м/с²",
+            explanation = "Наклон скорости по времени, посчитанный методом " +
+                "наименьших квадратов на окне 1.5 секунды. Разностью соседних " +
+                "замеров считать нельзя: скорость приходит целыми км/ч, и на " +
+                "ровном ходу это давало бы ±1.1 м/с² шума. Ноль на графике — " +
+                "посередине.",
+            modifier = Modifier.weight(1f),
+        ) {
+            InteractiveSeriesChart(
                 values = series.map { sample -> sample.accelerationMs2?.plus(ACCEL_SHIFT) },
-                color = MaterialTheme.colorScheme.error,
+                color = Palette.Coral,
+                unit = "м/с²",
                 modifier = Modifier.fillMaxSize(),
                 maxOverride = ACCEL_SHIFT * 2,
+                valueOffset = -ACCEL_SHIFT,
             )
         }
     }
@@ -457,104 +412,6 @@ private fun CurrentTripCharts(series: List<LiveSample>) {
 
 /** На сколько сдвигаем ускорение, чтобы отрицательные значения попали на график. */
 private const val ACCEL_SHIFT = 4.0
-
-@Composable
-private fun ChartBlock(
-    title: String,
-    color: Color,
-    modifier: Modifier = Modifier,
-    content: @Composable () -> Unit,
-) {
-    Card(modifier.fillMaxWidth()) {
-        Column(Modifier.padding(6.dp)) {
-            Text(
-                text = title,
-                style = MaterialTheme.typography.labelSmall,
-                color = color,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-            Box(Modifier.weight(1f).fillMaxWidth()) { content() }
-        }
-    }
-}
-
-@Composable
-private fun StatusRow(live: LiveState) {
-    Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp)) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            if (live.connection == ConnectionState.CONNECTING ||
-                live.connection == ConnectionState.INITIALIZING ||
-                live.connection == ConnectionState.WAITING
-            ) {
-                CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp)
-                Spacer(Modifier.width(8.dp))
-            }
-            Text(
-                text = live.status,
-                style = MaterialTheme.typography.bodySmall,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis,
-                color = if (live.connection == ConnectionState.ERROR) {
-                    MaterialTheme.colorScheme.error
-                } else {
-                    MaterialTheme.colorScheme.onSurfaceVariant
-                },
-            )
-        }
-        if (live.protocol.isNotBlank()) {
-            Text(
-                text = "Протокол: ${live.protocol}",
-                style = MaterialTheme.typography.labelSmall,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        }
-        if (live.diagnostics.isNotBlank()) {
-            Text(
-                text = "PID расхода: ${live.diagnostics}",
-                style = MaterialTheme.typography.labelSmall,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        }
-    }
-}
-
-@Composable
-private fun TripSummary(live: LiveState) {
-    Card(Modifier.fillMaxWidth().padding(horizontal = 12.dp)) {
-        Row(
-            modifier = Modifier.fillMaxWidth().padding(10.dp),
-            horizontalArrangement = Arrangement.spacedBy(4.dp),
-        ) {
-            Cell(Modifier.weight(1f), "Пробег", Fmt.km(live.stats.distanceMeters))
-            Cell(Modifier.weight(1f), "Топливо", Fmt.liters(live.stats.fuelLiters))
-            Cell(Modifier.weight(1f), "Средний", Fmt.litersPer100(live.stats.averageLitersPer100Km))
-            Cell(Modifier.weight(1f), "В пути", Fmt.duration(live.stats.durationMillis))
-        }
-    }
-}
-
-@Composable
-private fun Cell(modifier: Modifier, title: String, value: String) {
-    Column(modifier) {
-        Text(
-            text = title,
-            style = MaterialTheme.typography.labelSmall,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-        )
-        Text(
-            text = value,
-            style = MaterialTheme.typography.titleSmall,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-        )
-    }
-}
 
 @Composable
 private fun AdapterPickerDialog(
@@ -576,35 +433,49 @@ private fun AdapterPickerDialog(
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text(if (scanning) "Ищу адаптеры…" else "Адаптеры") },
+        containerColor = Palette.SurfaceHigh,
+        title = {
+            Text(
+                if (scanning) "Ищу адаптеры…" else "Адаптеры",
+                style = MaterialTheme.typography.titleMedium,
+            )
+        },
         text = {
             if (sorted.isEmpty()) {
-                Text("Пока ничего не нашлось. Включи адаптер в разъём OBD-II и подожди.")
+                Text(
+                    "Пока ничего не нашлось. Включи адаптер в разъём OBD-II и подожди.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Palette.TextSecondary,
+                )
             } else {
                 LazyColumn(Modifier.height(320.dp)) {
                     items(sorted, key = { it.address }) { adapter ->
-                        Column(Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
-                            TextButton(onClick = { onPick(adapter) }) {
-                                Column(Modifier.fillMaxWidth()) {
-                                    Text(
-                                        text = adapter.displayName +
-                                            if (adapter.looksLikeObd) "  ✓ похоже на OBD" else "",
-                                        style = MaterialTheme.typography.titleSmall,
-                                    )
-                                    Text(
-                                        text = adapter.address +
-                                            if (adapter.bonded) " · сопряжён" else "",
-                                        style = MaterialTheme.typography.bodySmall,
-                                        fontFamily = FontFamily.Monospace,
-                                    )
-                                }
+                        Column(
+                            Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 6.dp),
+                        ) {
+                            Panel(onClick = { onPick(adapter) }) {
+                                Text(
+                                    text = adapter.displayName +
+                                        if (adapter.looksLikeObd) "  ✓ похоже на OBD" else "",
+                                    style = MaterialTheme.typography.titleSmall,
+                                )
+                                Text(
+                                    text = adapter.address +
+                                        if (adapter.bonded) " · сопряжён" else "",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    fontFamily = FontFamily.Monospace,
+                                    color = Palette.TextMuted,
+                                )
                             }
-                            HorizontalDivider()
                         }
                     }
                 }
             }
         },
-        confirmButton = { TextButton(onClick = onDismiss) { Text("Закрыть") } },
+        confirmButton = {
+            TextButton(onClick = onDismiss) { Text("Закрыть", color = Palette.Accent) }
+        },
     )
 }
